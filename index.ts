@@ -64,12 +64,12 @@ function runOnEC2(cmd: string, timeoutMs = 300000): Promise<string> {
   });
 }
 
-async function uploadFile(filename: string, content: string): Promise<string> {
+async function uploadFile(filename: string, content: string, dir?: string): Promise<string> {
   const jobId = Date.now().toString(36);
-  const jobDir = `/tmp/mcp_jobs/${jobId}`;
+  const jobDir = dir || `/tmp/mcp_jobs/${jobId}`;
   await runOnEC2(`mkdir -p ${jobDir}`);
-  const escaped = content.replace(/\\/g, "\\\\").replace(/'/g, "'\\''");
-  await runOnEC2(`cat > ${jobDir}/${filename} << 'ZYPHAR_VERILOG_EOF'\n${escaped}\nZYPHAR_VERILOG_EOF`);
+  // Quoted heredoc << 'EOF' preserves content literally -- no escaping needed
+  await runOnEC2(`cat > ${jobDir}/${filename} << 'ZYPHAR_EOF_MARKER'\n${content}\nZYPHAR_EOF_MARKER`);
   return `${jobDir}/${filename}`;
 }
 
@@ -226,10 +226,8 @@ server.tool(
     const jobId = Date.now().toString(36);
     const jobDir = `/tmp/mcp_sim/${jobId}`;
     await runOnEC2(`mkdir -p ${jobDir}`);
-    const escDesign = verilog.replace(/\\/g, "\\\\").replace(/'/g, "'\\''");
-    const escTb = testbench.replace(/\\/g, "\\\\").replace(/'/g, "'\\''");
-    await runOnEC2(`cat > ${jobDir}/design.v << 'ZYPHAR_VERILOG_EOF'\n${escDesign}\nZYPHAR_VERILOG_EOF`);
-    await runOnEC2(`cat > ${jobDir}/tb.v << 'ZYPHAR_VERILOG_EOF'\n${escTb}\nZYPHAR_VERILOG_EOF`);
+    await runOnEC2(`cat > ${jobDir}/design.v << 'ZYPHAR_EOF_MARKER'\n${verilog}\nZYPHAR_EOF_MARKER`);
+    await runOnEC2(`cat > ${jobDir}/tb.v << 'ZYPHAR_EOF_MARKER'\n${testbench}\nZYPHAR_EOF_MARKER`);
     const output = await runOnEC2(
       `cd ${jobDir} && iverilog -o sim.vvp design.v tb.v 2>&1 && timeout 10 vvp sim.vvp 2>&1`,
       30000
@@ -253,8 +251,7 @@ server.tool(
     const jobId = Date.now().toString(36);
     const jobDir = `/tmp/mcp_fpga/${jobId}`;
     await runOnEC2(`mkdir -p ${jobDir}`);
-    const escaped = verilog.replace(/\\/g, "\\\\").replace(/'/g, "'\\''");
-    await runOnEC2(`cat > ${jobDir}/design.v << 'ZYPHAR_VERILOG_EOF'\n${escaped}\nZYPHAR_VERILOG_EOF`);
+    await runOnEC2(`cat > ${jobDir}/design.v << 'ZYPHAR_EOF_MARKER'\n${verilog}\nZYPHAR_EOF_MARKER`);
 
     const fpgaCmd: Record<string, string> = {
       ice40: `synth_ice40 -top ${top} -json ${jobDir}/out.json`,
