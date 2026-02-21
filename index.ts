@@ -73,6 +73,11 @@ async function uploadFile(filename: string, content: string): Promise<string> {
   return `${jobDir}/${filename}`;
 }
 
+function extractTopModule(verilog: string): string {
+  const match = verilog.match(/module\s+([a-zA-Z_][a-zA-Z0-9_]*)/);
+  return match ? match[1] : "top";
+}
+
 const server = new MCPServer({
   name: "zyphar-eda",
   title: "Zyphar EDA - Chip Design from Chat",
@@ -87,17 +92,18 @@ server.tool(
     description: "Run the full RTL-to-GDSII chip design flow on Verilog source code. Runs synthesis (Yosys), place & route (OpenROAD), and generates a physical layout. Returns cell count, die area, timing (WNS), and DRC violations.",
     schema: z.object({
       verilog: z.string().describe("Complete Verilog source code for the design"),
-      top_module: z.string().describe("Name of the top-level module"),
+      top_module: z.string().optional().describe("Top-level module name. Auto-detected from Verilog if omitted."),
       pdk: z.enum(["sky130", "gf180mcu", "asap7"]).default("sky130").describe("Process design kit: sky130 (130nm), gf180mcu (180nm), asap7 (7nm predictive)"),
       freq_mhz: z.number().default(100).describe("Target clock frequency in MHz"),
       clock_port: z.string().default("clk").describe("Name of the clock port in the design"),
     }),
   },
   async ({ verilog, top_module, pdk, freq_mhz, clock_port }) => {
+    const top = top_module || extractTopModule(verilog);
     const inputPath = await uploadFile("input.v", verilog);
     const jobDir = inputPath.replace("/input.v", "");
     const output = await runOnEC2(
-      `./target/release/zyphar flow -i ${inputPath} --top ${top_module} --pdk ${pdk} --freq ${freq_mhz} --clock ${clock_port} --output ${jobDir}/output 2>&1`,
+      `./target/release/zyphar flow -i ${inputPath} --top ${top} --pdk ${pdk} --freq ${freq_mhz} --clock ${clock_port} --output ${jobDir}/output 2>&1`,
       600000
     );
     return text(output);
@@ -134,15 +140,16 @@ server.tool(
     description: "Synthesize Verilog source code to a gate-level netlist using Yosys. Returns cell count, area breakdown, and the synthesized netlist. Faster than full design-chip since it skips place & route.",
     schema: z.object({
       verilog: z.string().describe("Complete Verilog source code"),
-      top_module: z.string().describe("Name of the top-level module"),
+      top_module: z.string().optional().describe("Top-level module name. Auto-detected from Verilog if omitted."),
       pdk: z.enum(["sky130", "gf180mcu", "asap7"]).default("sky130"),
     }),
   },
   async ({ verilog, top_module, pdk }) => {
+    const top = top_module || extractTopModule(verilog);
     const inputPath = await uploadFile("input.v", verilog);
     const jobDir = inputPath.replace("/input.v", "");
     const output = await runOnEC2(
-      `./target/release/zyphar flow -i ${inputPath} --top ${top_module} --pdk ${pdk} --skip-pnr --output ${jobDir}/output 2>&1`
+      `./target/release/zyphar flow -i ${inputPath} --top ${top} --pdk ${pdk} --skip-pnr --output ${jobDir}/output 2>&1`
     );
     return text(output);
   }
@@ -188,17 +195,18 @@ server.tool(
     description: "Run full RTL-to-GDSII flow WITH signoff verification (DRC + LVS). Takes longer but produces manufacturing-ready output with DRC clean and LVS verified results.",
     schema: z.object({
       verilog: z.string().describe("Complete Verilog source code for the design"),
-      top_module: z.string().describe("Name of the top-level module"),
+      top_module: z.string().optional().describe("Top-level module name. Auto-detected from Verilog if omitted."),
       pdk: z.enum(["sky130", "gf180mcu", "asap7"]).default("sky130"),
       freq_mhz: z.number().default(100).describe("Target clock frequency in MHz"),
       clock_port: z.string().default("clk").describe("Name of the clock port"),
     }),
   },
   async ({ verilog, top_module, pdk, freq_mhz, clock_port }) => {
+    const top = top_module || extractTopModule(verilog);
     const inputPath = await uploadFile("input.v", verilog);
     const jobDir = inputPath.replace("/input.v", "");
     const output = await runOnEC2(
-      `./target/release/zyphar flow -i ${inputPath} --top ${top_module} --pdk ${pdk} --freq ${freq_mhz} --clock ${clock_port} --output ${jobDir}/output --signoff --gds --detailed-route 2>&1`,
+      `./target/release/zyphar flow -i ${inputPath} --top ${top} --pdk ${pdk} --freq ${freq_mhz} --clock ${clock_port} --output ${jobDir}/output --signoff --gds --detailed-route 2>&1`,
       600000
     );
     return text(output);
