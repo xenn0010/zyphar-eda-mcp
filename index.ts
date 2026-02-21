@@ -213,6 +213,63 @@ server.tool(
   }
 );
 
+server.tool(
+  {
+    name: "simulate",
+    description: "Simulate a Verilog design with a testbench using Icarus Verilog. Proves functional correctness -- does the design actually do what it should? Returns simulation output including $display/$monitor messages. The testbench should use $finish to end simulation.",
+    schema: z.object({
+      verilog: z.string().describe("Complete Verilog source code for the design under test"),
+      testbench: z.string().describe("Verilog testbench that instantiates the design, drives inputs, and checks outputs using $display and $finish"),
+    }),
+  },
+  async ({ verilog, testbench }) => {
+    const jobId = Date.now().toString(36);
+    const jobDir = `/tmp/mcp_sim/${jobId}`;
+    await runOnEC2(`mkdir -p ${jobDir}`);
+    const escDesign = verilog.replace(/\\/g, "\\\\").replace(/'/g, "'\\''");
+    const escTb = testbench.replace(/\\/g, "\\\\").replace(/'/g, "'\\''");
+    await runOnEC2(`cat > ${jobDir}/design.v << 'ZYPHAR_VERILOG_EOF'\n${escDesign}\nZYPHAR_VERILOG_EOF`);
+    await runOnEC2(`cat > ${jobDir}/tb.v << 'ZYPHAR_VERILOG_EOF'\n${escTb}\nZYPHAR_VERILOG_EOF`);
+    const output = await runOnEC2(
+      `cd ${jobDir} && iverilog -o sim.vvp design.v tb.v 2>&1 && timeout 10 vvp sim.vvp 2>&1`,
+      30000
+    );
+    return text(output);
+  }
+);
+
+server.tool(
+  {
+    name: "fpga-synthesize",
+    description: "Synthesize Verilog for FPGA using Yosys. Maps the design to FPGA primitives (LUTs, flip-flops, BRAMs) and reports resource utilization. Proves the design can run on real FPGA hardware. Supported targets: ice40 (Lattice iCE40), ecp5 (Lattice ECP5), xilinx (Xilinx 7-series).",
+    schema: z.object({
+      verilog: z.string().describe("Complete Verilog source code"),
+      top_module: z.string().optional().describe("Top-level module name. Auto-detected if omitted."),
+      fpga: z.enum(["ice40", "ecp5", "xilinx"]).default("ice40").describe("FPGA target: ice40 (Lattice iCE40 HX8K), ecp5 (Lattice ECP5), xilinx (Xilinx 7-series)"),
+    }),
+  },
+  async ({ verilog, top_module, fpga }) => {
+    const top = top_module || extractTopModule(verilog);
+    const jobId = Date.now().toString(36);
+    const jobDir = `/tmp/mcp_fpga/${jobId}`;
+    await runOnEC2(`mkdir -p ${jobDir}`);
+    const escaped = verilog.replace(/\\/g, "\\\\").replace(/'/g, "'\\''");
+    await runOnEC2(`cat > ${jobDir}/design.v << 'ZYPHAR_VERILOG_EOF'\n${escaped}\nZYPHAR_VERILOG_EOF`);
+
+    const fpgaCmd: Record<string, string> = {
+      ice40: `synth_ice40 -top ${top} -json ${jobDir}/out.json`,
+      ecp5: `synth_ecp5 -top ${top} -json ${jobDir}/out.json`,
+      xilinx: `synth_xilinx -top ${top} -json ${jobDir}/out.json`,
+    };
+
+    const output = await runOnEC2(
+      `yosys -p "read_verilog ${jobDir}/design.v; ${fpgaCmd[fpga]}; stat" 2>&1 | grep -E "(Number of|SB_|TRELLIS_|LUT|DFF|BRAM|CARRY|Chip|cells|wire|Error|ERROR|error|Warning)" | head -40`,
+      60000
+    );
+    return text(`FPGA Synthesis Results (${fpga.toUpperCase()})\n${output}`);
+  }
+);
+
 server.prompt(
   {
     name: "design-a-chip",
@@ -230,11 +287,13 @@ server.prompt(
             type: "text" as const,
             text: `You are a chip design assistant with access to Zyphar EDA tools that run real industry-grade synthesis (Yosys) and place & route (OpenROAD) on a cloud server.
 
-WORKFLOW:
+WORKFLOW -- follow these steps in order:
 1. Write complete, synthesizable Verilog for the user's request. Use Verilog-2005 (not SystemVerilog). Always include a clock port named "clk" for sequential designs.
-2. Call the "design-chip" tool with the Verilog source. The top module name is auto-detected. Default PDK is sky130 (130nm), default frequency is 100 MHz.
-3. Present the results clearly: cell count, die area (um2), timing slack (WNS), number of instances, and total runtime.
-4. If the user wants changes, modify the Verilog and re-run.
+2. Write a testbench that exercises the design with test vectors and uses $display to show results.
+3. Call "simulate" with both the design and testbench. This proves functional correctness.
+4. Call "fpga-synthesize" to show it maps to real FPGA hardware (LUTs, flip-flops).
+5. Call "design-chip" to run full ASIC synthesis + place & route. This produces a physical chip layout.
+6. Present all results: simulation PASS/FAIL, FPGA resources, ASIC cell count, die area, timing.
 
 VERILOG RULES:
 - Use "always @(posedge clk)" for sequential logic, "always @(*)" for combinational
@@ -243,12 +302,21 @@ VERILOG RULES:
 - Keep designs under 1000 lines for fast turnaround (2-5 seconds)
 - No SystemVerilog features (no "logic", no "always_ff", no interfaces)
 
+TESTBENCH RULES:
+- Instantiate the design under test
+- Generate clock: always #5 clk = ~clk;
+- Drive inputs and check outputs with $display
+- Print PASS or FAIL based on expected vs actual values
+- End with $finish
+
 AVAILABLE TOOLS:
-- design-chip: Full RTL-to-GDSII (synthesis + place & route). Takes 2-15 seconds depending on size.
-- synthesize: Synthesis only (faster, no layout). Good for checking cell count first.
-- estimate-ppa: Instant PPA estimate from cell count. No tools needed.
-- run-demo-design: Run a known-good design (picorv32, uart_tx, alu_8bit) to demonstrate the flow.
-- design-chip-signoff: Full flow + DRC + LVS verification. Takes longer but proves manufacturing readiness.
+- simulate: Run Verilog simulation with testbench (iverilog). Proves the design WORKS. ~1 second.
+- fpga-synthesize: Synthesize for FPGA (iCE40/ECP5/Xilinx). Proves it runs on FPGA hardware. ~2 seconds.
+- design-chip: Full ASIC RTL-to-GDSII (Yosys + OpenROAD). Produces physical chip layout. ~2-15 seconds.
+- synthesize: ASIC synthesis only (faster, no layout).
+- estimate-ppa: Instant PPA estimate from cell count.
+- run-demo-design: Run a known-good design (picorv32, uart_tx, alu_8bit).
+- design-chip-signoff: Full flow + DRC + LVS verification for manufacturing readiness.
 
 The user wants to design: ${description || "a chip (ask them what kind)"}`,
           },
