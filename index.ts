@@ -7,6 +7,9 @@ const EC2_HOST = "ec2-18-219-59-121.us-east-2.compute.amazonaws.com";
 const ZYPHAR_ENV = "export PATH=$HOME/.cargo/bin:$PATH && export ORFS_PATH=/tmp/OpenROAD-flow-scripts && cd ~/Zyphar-new";
 
 function getSSHKey(): string {
+  if (process.env.SSH_PRIVATE_KEY_B64) {
+    return Buffer.from(process.env.SSH_PRIVATE_KEY_B64, "base64").toString("utf-8");
+  }
   if (process.env.SSH_PRIVATE_KEY) {
     return process.env.SSH_PRIVATE_KEY;
   }
