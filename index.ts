@@ -97,7 +97,7 @@ server.tool(
     const inputPath = await uploadFile("input.v", verilog);
     const jobDir = inputPath.replace("/input.v", "");
     const output = await runOnEC2(
-      `./target/release/zyphar flow -i ${inputPath} --top ${top_module} --pdk ${pdk} --freq ${freq_mhz} --clock ${clock_port} --output-dir ${jobDir}/output 2>&1`,
+      `./target/release/zyphar flow -i ${inputPath} --top ${top_module} --pdk ${pdk} --freq ${freq_mhz} --clock ${clock_port} --output ${jobDir}/output 2>&1`,
       600000
     );
     return text(output);
@@ -121,7 +121,7 @@ server.tool(
     };
     const [path, top] = paths[design];
     const output = await runOnEC2(
-      `./target/release/zyphar flow -i ${path} --top ${top} --pdk sky130 --freq ${freq_mhz} --output-dir /tmp/mcp_demo_${design}_${Date.now()} 2>&1`,
+      `./target/release/zyphar flow -i ${path} --top ${top} --pdk sky130 --freq ${freq_mhz} --output /tmp/mcp_demo_${design}_${Date.now()} 2>&1`,
       600000
     );
     return text(output);
@@ -142,7 +142,7 @@ server.tool(
     const inputPath = await uploadFile("input.v", verilog);
     const jobDir = inputPath.replace("/input.v", "");
     const output = await runOnEC2(
-      `./target/release/zyphar flow -i ${inputPath} --top ${top_module} --pdk ${pdk} --synth-only --output-dir ${jobDir}/output 2>&1`
+      `./target/release/zyphar flow -i ${inputPath} --top ${top_module} --pdk ${pdk} --skip-pnr --output ${jobDir}/output 2>&1`
     );
     return text(output);
   }
@@ -184,34 +184,22 @@ server.tool(
 
 server.tool(
   {
-    name: "run-drc",
-    description: "Run design rule check (DRC) on a GDS file using KLayout with foundry rule decks. Checks for manufacturing violations like minimum spacing, width, and overlap errors.",
+    name: "design-chip-signoff",
+    description: "Run full RTL-to-GDSII flow WITH signoff verification (DRC + LVS). Takes longer but produces manufacturing-ready output with DRC clean and LVS verified results.",
     schema: z.object({
-      gds_path: z.string().describe("Path to GDS file on the server"),
-      top_cell: z.string().describe("Name of the top-level cell in the GDS"),
+      verilog: z.string().describe("Complete Verilog source code for the design"),
+      top_module: z.string().describe("Name of the top-level module"),
+      pdk: z.enum(["sky130", "gf180mcu", "asap7"]).default("sky130"),
+      freq_mhz: z.number().default(100).describe("Target clock frequency in MHz"),
+      clock_port: z.string().default("clk").describe("Name of the clock port"),
     }),
   },
-  async ({ gds_path, top_cell }) => {
+  async ({ verilog, top_module, pdk, freq_mhz, clock_port }) => {
+    const inputPath = await uploadFile("input.v", verilog);
+    const jobDir = inputPath.replace("/input.v", "");
     const output = await runOnEC2(
-      `./target/release/zyphar flow --drc-only --gds ${gds_path} --top ${top_cell} --pdk sky130 2>&1`
-    );
-    return text(output);
-  }
-);
-
-server.tool(
-  {
-    name: "run-lvs",
-    description: "Run layout vs schematic (LVS) verification. Checks that the physical layout matches the intended circuit schematic -- critical for tapeout.",
-    schema: z.object({
-      gds_path: z.string().describe("Path to GDS file on the server"),
-      netlist_path: z.string().describe("Path to reference netlist on the server"),
-      top_cell: z.string().describe("Name of the top-level cell"),
-    }),
-  },
-  async ({ gds_path, netlist_path, top_cell }) => {
-    const output = await runOnEC2(
-      `./target/release/zyphar flow --lvs-only --gds ${gds_path} --netlist ${netlist_path} --top ${top_cell} --pdk sky130 2>&1`
+      `./target/release/zyphar flow -i ${inputPath} --top ${top_module} --pdk ${pdk} --freq ${freq_mhz} --clock ${clock_port} --output ${jobDir}/output --signoff --gds --detailed-route 2>&1`,
+      600000
     );
     return text(output);
   }
