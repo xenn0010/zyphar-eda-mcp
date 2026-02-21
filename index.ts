@@ -260,10 +260,17 @@ server.tool(
     };
 
     const output = await runOnEC2(
-      `yosys -p "read_verilog ${jobDir}/design.v; ${fpgaCmd[fpga]}; stat" 2>&1 | grep -E "(Number of|SB_|TRELLIS_|LUT|DFF|BRAM|CARRY|Chip|cells|wire|Error|ERROR|error|Warning)" | head -40`,
+      `yosys -p "read_verilog ${jobDir}/design.v; ${fpgaCmd[fpga]}; stat" 2>&1`,
       60000
     );
-    return text(`FPGA Synthesis Results (${fpga.toUpperCase()})\n${output}`);
+    // Extract just the stat summary (after "Printing statistics.")
+    const statIdx = output.indexOf("Printing statistics.");
+    const errorLines = output.split("\n").filter(l => /ERROR|error:/.test(l));
+    if (errorLines.length > 0) {
+      return text(`FPGA Synthesis FAILED (${fpga.toUpperCase()})\n${errorLines.join("\n")}`);
+    }
+    const stats = statIdx >= 0 ? output.slice(statIdx) : output.slice(-500);
+    return text(`FPGA Synthesis Results (${fpga.toUpperCase()})\n${stats.trim()}`);
   }
 );
 
