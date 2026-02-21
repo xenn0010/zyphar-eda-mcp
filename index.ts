@@ -213,6 +213,85 @@ server.tool(
   }
 );
 
+server.prompt(
+  {
+    name: "design-a-chip",
+    description: "Design a custom chip from a natural language description. Guides you through writing Verilog, running synthesis and place & route, and interpreting the results.",
+    schema: z.object({
+      description: z.string().optional().describe("What kind of chip to design, e.g. 'a UART transmitter' or 'an 8-bit CPU'"),
+    }),
+  },
+  async ({ description }) => {
+    return {
+      messages: [
+        {
+          role: "user" as const,
+          content: {
+            type: "text" as const,
+            text: `You are a chip design assistant with access to Zyphar EDA tools that run real industry-grade synthesis (Yosys) and place & route (OpenROAD) on a cloud server.
+
+WORKFLOW:
+1. Write complete, synthesizable Verilog for the user's request. Use Verilog-2005 (not SystemVerilog). Always include a clock port named "clk" for sequential designs.
+2. Call the "design-chip" tool with the Verilog source. The top module name is auto-detected. Default PDK is sky130 (130nm), default frequency is 100 MHz.
+3. Present the results clearly: cell count, die area (um2), timing slack (WNS), number of instances, and total runtime.
+4. If the user wants changes, modify the Verilog and re-run.
+
+VERILOG RULES:
+- Use "always @(posedge clk)" for sequential logic, "always @(*)" for combinational
+- Use "assign" for simple combinational outputs
+- Register all outputs for better timing
+- Keep designs under 1000 lines for fast turnaround (2-5 seconds)
+- No SystemVerilog features (no "logic", no "always_ff", no interfaces)
+
+AVAILABLE TOOLS:
+- design-chip: Full RTL-to-GDSII (synthesis + place & route). Takes 2-15 seconds depending on size.
+- synthesize: Synthesis only (faster, no layout). Good for checking cell count first.
+- estimate-ppa: Instant PPA estimate from cell count. No tools needed.
+- run-demo-design: Run a known-good design (picorv32, uart_tx, alu_8bit) to demonstrate the flow.
+- design-chip-signoff: Full flow + DRC + LVS verification. Takes longer but proves manufacturing readiness.
+
+The user wants to design: ${description || "a chip (ask them what kind)"}`,
+          },
+        },
+      ],
+    };
+  }
+);
+
+server.prompt(
+  {
+    name: "demo",
+    description: "Run a quick demo showing Zyphar designing a real chip in seconds. Perfect for showing the platform capabilities.",
+    schema: z.object({}),
+  },
+  async () => {
+    return {
+      messages: [
+        {
+          role: "user" as const,
+          content: {
+            type: "text" as const,
+            text: `You are demoing Zyphar EDA -- a platform that designs real chips from chat.
+
+Run this demo sequence:
+1. First, call "run-demo-design" with design "alu_8bit" to show a quick design (takes ~2 seconds).
+2. Present the results: cell count, area, timing, runtime.
+3. Then call "run-demo-design" with design "picorv32" to show a full RISC-V CPU being designed (takes ~15 seconds, 14K+ cells).
+4. Present the results and compare: the platform just designed a complete RISC-V CPU with 14,000+ instances in under 20 seconds.
+5. Explain that users can also write their own Verilog and have it synthesized and placed & routed in seconds using the "design-chip" tool.
+
+Key talking points:
+- This is REAL synthesis (Yosys) and place & route (OpenROAD), not simulation
+- The output is a physical chip layout (DEF file) that could be sent to a foundry
+- Supports 3 PDKs: Sky130 (130nm, Google/SkyWater), GF180MCU (180nm, GlobalFoundries), ASAP7 (7nm predictive)
+- Designs from 10 cells to 50,000+ cells in seconds to minutes`,
+          },
+        },
+      ],
+    };
+  }
+);
+
 server.listen().then(() => {
   console.log("Zyphar EDA MCP server running");
 });
