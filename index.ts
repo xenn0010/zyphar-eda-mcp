@@ -1,4 +1,4 @@
-import { MCPServer, text } from "mcp-use/server";
+import { MCPServer, text, widget } from "mcp-use/server";
 import { z } from "zod";
 import { Client } from "ssh2";
 import { readFileSync } from "fs";
@@ -78,6 +78,127 @@ function extractTopModule(verilog: string): string {
   return match ? match[1] : "top";
 }
 
+function parseDesignStats(output: string): Record<string, string> {
+  const stats: Record<string, string> = {};
+  for (const line of output.split("\n")) {
+    const trimmed = line.trim();
+    if (/^Cells:/.test(trimmed)) stats.cells = trimmed.replace("Cells:", "").trim();
+    if (/^Area:/.test(trimmed)) stats.area = trimmed.replace("Area:", "").trim();
+    if (/^WNS:/.test(trimmed)) stats.wns = trimmed.replace("WNS:", "").trim();
+    if (/^Instances:/.test(trimmed)) stats.instances = trimmed.replace("Instances:", "").trim();
+    if (/^Duration:/.test(trimmed)) stats.duration = trimmed.replace("Duration:", "").trim();
+    if (/Flow completed/.test(trimmed)) stats.status = "completed";
+  }
+  return stats;
+}
+
+async function getGdsiiBase64(jobDir: string, top: string): Promise<string | null> {
+  try {
+    const b64 = await runOnEC2(
+      `gds_file=$(find ${jobDir}/output -name "*.gds" 2>/dev/null | head -1) && [ -f "$gds_file" ] && base64 "$gds_file" | tr -d '\\n' || echo "NO_GDS"`,
+      30000
+    );
+    if (b64.trim() === "NO_GDS" || b64.trim().length < 100) return null;
+    return b64.trim();
+  } catch {
+    return null;
+  }
+}
+
+const CHIP_RESULT_HTML = `<!DOCTYPE html>
+<html>
+<head>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 16px; background: var(--color-bg, #fff); color: var(--color-text, #1a1a2e); }
+  .card { border: 1px solid var(--color-border, #e0e0e0); border-radius: 12px; padding: 20px; max-width: 480px; }
+  .header { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
+  .chip-icon { width: 36px; height: 36px; background: #16213e; border-radius: 8px; display: flex; align-items: center; justify-content: center; color: #00d4ff; font-size: 18px; font-weight: bold; }
+  .title { font-size: 18px; font-weight: 600; }
+  .subtitle { font-size: 12px; color: #666; }
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 16px; }
+  .stat { background: var(--color-surface, #f5f5f5); padding: 10px 12px; border-radius: 8px; }
+  .stat-label { font-size: 11px; text-transform: uppercase; color: #888; letter-spacing: 0.5px; }
+  .stat-value { font-size: 16px; font-weight: 600; margin-top: 2px; }
+  .download-btn { display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%; padding: 12px; background: #16213e; color: #fff; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; transition: background 0.2s; }
+  .download-btn:hover { background: #1a2744; }
+  .download-btn:disabled { background: #999; cursor: not-allowed; }
+  .download-btn svg { width: 18px; height: 18px; }
+  .no-gds { text-align: center; padding: 8px; color: #888; font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="card" id="root">
+  <div class="header">
+    <div class="chip-icon">IC</div>
+    <div>
+      <div class="title" id="design-name">Chip Design</div>
+      <div class="subtitle" id="pdk-info">Sky130 130nm</div>
+    </div>
+  </div>
+  <div class="stats" id="stats-grid"></div>
+  <div id="download-area"></div>
+</div>
+<script>
+function render(props) {
+  if (!props) return;
+  if (props.designName) document.getElementById('design-name').textContent = props.designName;
+  if (props.pdk) document.getElementById('pdk-info').textContent = props.pdk;
+  const grid = document.getElementById('stats-grid');
+  grid.innerHTML = '';
+  const entries = [
+    ['Cells', props.cells],
+    ['Area', props.area],
+    ['Timing (WNS)', props.wns],
+    ['Runtime', props.duration],
+  ].filter(e => e[1]);
+  entries.forEach(([label, value]) => {
+    grid.innerHTML += '<div class="stat"><div class="stat-label">' + label + '</div><div class="stat-value">' + value + '</div></div>';
+  });
+  const dlArea = document.getElementById('download-area');
+  if (props.gdsii_base64) {
+    dlArea.innerHTML = '<button class="download-btn" id="dl-btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Download GDSII</button>';
+    document.getElementById('dl-btn').addEventListener('click', function() {
+      var raw = atob(props.gdsii_base64);
+      var bytes = new Uint8Array(raw.length);
+      for (var i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+      var blob = new Blob([bytes], { type: 'application/octet-stream' });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = (props.filename || 'design') + '.gds';
+      document.body.appendChild(a);
+      a.click();
+      URL.revokeObjectURL(url);
+      a.remove();
+    });
+  } else {
+    dlArea.innerHTML = '<div class="no-gds">GDSII not generated. Use design-chip-signoff for downloadable layout.</div>';
+  }
+}
+// MCP Apps bridge (Claude, Cursor)
+if (window.parent !== window) {
+  window.addEventListener('message', function(e) {
+    if (e.data && e.data.type === 'ui/notifications/tool-result' && e.data.structuredContent) {
+      render(e.data.structuredContent);
+    }
+  });
+  window.parent.postMessage({ type: 'ui/initialize', version: '1.0' }, '*');
+}
+// ChatGPT Apps SDK
+if (window.openai && window.openai.toolOutput) render(window.openai.toolOutput);
+window.addEventListener('openai:set_globals', function(e) {
+  if (e.detail && e.detail.globals && e.detail.globals.toolOutput) render(e.detail.globals.toolOutput);
+});
+// URL params fallback (dev inspector)
+try {
+  var p = new URLSearchParams(window.location.search);
+  if (p.get('mcpUseParams')) render(JSON.parse(decodeURIComponent(p.get('mcpUseParams'))));
+} catch(e) {}
+</script>
+</body>
+</html>`;
+
 const server = new MCPServer({
   name: "zyphar-eda",
   title: "Zyphar EDA - Chip Design from Chat",
@@ -86,10 +207,18 @@ const server = new MCPServer({
   baseUrl: process.env.MCP_URL || "http://localhost:3000",
 });
 
+server.uiResource({
+  type: "rawHtml",
+  name: "chip-design-result",
+  title: "Chip Design Result",
+  description: "Interactive chip design results with GDSII download",
+  htmlContent: CHIP_RESULT_HTML,
+});
+
 server.tool(
   {
     name: "design-chip",
-    description: "Run the full RTL-to-GDSII chip design flow on Verilog source code. Runs synthesis (Yosys), place & route (OpenROAD), and generates a physical layout. Returns cell count, die area, timing (WNS), and DRC violations.",
+    description: "Run the full RTL-to-GDSII chip design flow on Verilog source code. Runs synthesis (Yosys), place & route (OpenROAD), and generates a physical layout with downloadable GDSII file. Returns cell count, die area, timing (WNS), and an interactive results card with download button.",
     schema: z.object({
       verilog: z.string().describe("Complete Verilog source code for the design"),
       top_module: z.string().optional().describe("Top-level module name. Auto-detected from Verilog if omitted."),
@@ -97,16 +226,36 @@ server.tool(
       freq_mhz: z.number().default(100).describe("Target clock frequency in MHz"),
       clock_port: z.string().default("clk").describe("Name of the clock port in the design"),
     }),
+    widget: {
+      name: "chip-design-result",
+      invoking: "Designing chip...",
+      invoked: "Chip design complete",
+    },
   },
   async ({ verilog, top_module, pdk, freq_mhz, clock_port }) => {
     const top = top_module || extractTopModule(verilog);
     const inputPath = await uploadFile("input.v", verilog);
     const jobDir = inputPath.replace("/input.v", "");
     const output = await runOnEC2(
-      `./target/release/zyphar flow -i ${inputPath} --top ${top} --pdk ${pdk} --freq ${freq_mhz} --clock ${clock_port} --no-pdn --util 0.45 --output ${jobDir}/output 2>&1`,
+      `./target/release/zyphar flow -i ${inputPath} --top ${top} --pdk ${pdk} --freq ${freq_mhz} --clock ${clock_port} --no-pdn --util 0.45 --gds --output ${jobDir}/output 2>&1`,
       600000
     );
-    return text(output);
+    const stats = parseDesignStats(output);
+    const gdsii_base64 = await getGdsiiBase64(jobDir, top);
+    const pdkLabel: Record<string, string> = { sky130: "Sky130 130nm", gf180mcu: "GF180MCU 180nm", asap7: "ASAP7 7nm" };
+    return widget({
+      props: {
+        designName: top,
+        pdk: pdkLabel[pdk] || pdk,
+        cells: stats.cells || stats.instances || "N/A",
+        area: stats.area || "N/A",
+        wns: stats.wns || "N/A",
+        duration: stats.duration || "N/A",
+        gdsii_base64: gdsii_base64,
+        filename: top,
+      },
+      output: text(output),
+    });
   }
 );
 
@@ -192,7 +341,7 @@ server.tool(
 server.tool(
   {
     name: "design-chip-signoff",
-    description: "Run full RTL-to-GDSII flow WITH signoff verification (DRC + LVS). Takes longer but produces manufacturing-ready output with DRC clean and LVS verified results.",
+    description: "Run full RTL-to-GDSII flow WITH signoff verification (DRC + LVS). Takes longer but produces manufacturing-ready output with DRC clean and LVS verified results. Returns an interactive card with downloadable GDSII file.",
     schema: z.object({
       verilog: z.string().describe("Complete Verilog source code for the design"),
       top_module: z.string().optional().describe("Top-level module name. Auto-detected from Verilog if omitted."),
@@ -200,6 +349,11 @@ server.tool(
       freq_mhz: z.number().default(100).describe("Target clock frequency in MHz"),
       clock_port: z.string().default("clk").describe("Name of the clock port"),
     }),
+    widget: {
+      name: "chip-design-result",
+      invoking: "Designing chip with signoff...",
+      invoked: "Chip design with signoff complete",
+    },
   },
   async ({ verilog, top_module, pdk, freq_mhz, clock_port }) => {
     const top = top_module || extractTopModule(verilog);
@@ -209,7 +363,22 @@ server.tool(
       `./target/release/zyphar flow -i ${inputPath} --top ${top} --pdk ${pdk} --freq ${freq_mhz} --clock ${clock_port} --no-pdn --util 0.45 --output ${jobDir}/output --signoff --gds --detailed-route 2>&1`,
       600000
     );
-    return text(output);
+    const stats = parseDesignStats(output);
+    const gdsii_base64 = await getGdsiiBase64(jobDir, top);
+    const pdkLabel: Record<string, string> = { sky130: "Sky130 130nm", gf180mcu: "GF180MCU 180nm", asap7: "ASAP7 7nm" };
+    return widget({
+      props: {
+        designName: top,
+        pdk: pdkLabel[pdk] || pdk,
+        cells: stats.cells || stats.instances || "N/A",
+        area: stats.area || "N/A",
+        wns: stats.wns || "N/A",
+        duration: stats.duration || "N/A",
+        gdsii_base64: gdsii_base64,
+        filename: top,
+      },
+      output: text(output),
+    });
   }
 );
 
