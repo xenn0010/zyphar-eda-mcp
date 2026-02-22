@@ -1,4 +1,4 @@
-import { MCPServer, text, widget } from "mcp-use/server";
+import { MCPServer, text, image, mix, widget } from "mcp-use/server";
 import { z } from "zod";
 import { Client } from "ssh2";
 import { readFileSync } from "fs";
@@ -119,6 +119,23 @@ async function extract3DLayout(jobDir: string): Promise<any | null> {
     if (!result.includes("OK")) return null;
     const json = await runOnEC2(`cat ${jsonPath}`);
     return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}
+
+async function renderLayoutPng(jobDir: string): Promise<string | null> {
+  try {
+    const jsonPath = `${jobDir}/output/layout_3d.json`;
+    const pngPath = `${jobDir}/output/layout.png`;
+    const result = await runOnEC2(
+      `JSON_PATH=${jsonPath} OUT_PATH=${pngPath} python3 /tmp/render_layout.py 2>&1`,
+      15000
+    );
+    if (!result.includes("OK")) return null;
+    const b64 = await runOnEC2(`base64 ${pngPath} | tr -d '\\n'`, 15000);
+    if (b64.trim().length > 100) return b64.trim();
+    return null;
   } catch {
     return null;
   }
@@ -576,15 +593,20 @@ server.tool(
   async ({ job_dir }) => {
     const layout3d = await extract3DLayout(job_dir);
     if (!layout3d) {
-      return text("No GDSII file found. Run design-chip with --gds first.");
+      return text("No GDSII file found. Run design-chip first.");
     }
     const totalPolys = layout3d.layers.reduce((s: number, l: any) => s + l.polygons.length, 0);
+    const summary = `3D Layout: ${layout3d.die.w.toFixed(1)} x ${layout3d.die.h.toFixed(1)} um die, ${layout3d.layers.length} layers, ${totalPolys} polygons`;
+    const pngB64 = await renderLayoutPng(job_dir);
+    if (pngB64) {
+      return widget({
+        props: { layout3d },
+        output: mix(image(pngB64, "image/png"), text(summary)),
+      });
+    }
     return widget({
       props: { layout3d },
-      output: text(
-        `3D Layout: ${layout3d.die.w.toFixed(1)} x ${layout3d.die.h.toFixed(1)} um die, ` +
-        `${layout3d.layers.length} layers, ${totalPolys} polygons`
-      ),
+      output: text(summary),
     });
   }
 );
