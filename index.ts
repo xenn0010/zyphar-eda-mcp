@@ -141,272 +141,12 @@ async function renderLayoutPng(jobDir: string): Promise<string | null> {
   }
 }
 
-const CHIP_3D_HTML = `<!DOCTYPE html>
-<html>
-<head>
-<style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { background: #1a1a2e; overflow: hidden; }
-  #canvas { width: 100%; height: 100%; display: block; }
-  #info { position: absolute; top: 8px; left: 8px; color: #ccc; font: 12px -apple-system, sans-serif; pointer-events: none; }
-  #info span { background: rgba(0,0,0,0.6); padding: 2px 6px; border-radius: 4px; }
-  #legend { position: absolute; bottom: 8px; left: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
-  .leg { font: 10px -apple-system, sans-serif; color: #ccc; display: flex; align-items: center; gap: 3px; background: rgba(0,0,0,0.5); padding: 2px 6px; border-radius: 3px; cursor: pointer; user-select: none; }
-  .leg.off { opacity: 0.3; }
-  .leg-dot { width: 8px; height: 8px; border-radius: 2px; }
-  #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); color: #888; font: 14px sans-serif; }
-</style>
-</head>
-<body>
-<canvas id="canvas"></canvas>
-<div id="info"><span id="info-text">Drag to rotate, scroll to zoom</span></div>
-<div id="legend" id="legend"></div>
-<div id="loading">Loading 3D layout...</div>
-<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}</script>
-<script type="module">
-import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-
-const canvas = document.getElementById('canvas');
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-renderer.setPixelRatio(window.devicePixelRatio);
-renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.setClearColor(0x1a1a2e);
-
-const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.01, 10000);
-const controls = new OrbitControls(camera, canvas);
-controls.enableDamping = true;
-controls.dampingFactor = 0.1;
-
-scene.add(new THREE.AmbientLight(0xffffff, 0.5));
-const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
-dirLight.position.set(1, 2, 1);
-scene.add(dirLight);
-
-const layerGroups = {};
-
-function buildScene(data) {
-  document.getElementById('loading').style.display = 'none';
-  const die = data.die;
-  const cx = die.x + die.w / 2, cy = die.y + die.h / 2;
-  const scale = 100 / Math.max(die.w, die.h);
-  const zScale = scale * 150;
-
-  // Substrate
-  const subGeo = new THREE.BoxGeometry(die.w * scale, 0.5, die.h * scale);
-  const subMat = new THREE.MeshPhongMaterial({ color: 0x2a2a3a });
-  const sub = new THREE.Mesh(subGeo, subMat);
-  sub.position.set(0, -0.3, 0);
-  scene.add(sub);
-
-  const legend = document.getElementById('legend');
-  data.layers.forEach(function(layer) {
-    var color = parseInt(layer.color.replace('#',''), 16);
-    var mat = new THREE.MeshPhongMaterial({
-      color: color,
-      transparent: true,
-      opacity: layer.opacity,
-      side: THREE.DoubleSide,
-    });
-    var group = new THREE.Group();
-    group.name = layer.name;
-    layerGroups[layer.name] = group;
-
-    layer.polygons.forEach(function(pts) {
-      var shape = new THREE.Shape();
-      for (var i = 0; i < pts.length; i++) {
-        var x = (pts[i][0] - cx) * scale;
-        var y = (pts[i][1] - cy) * scale;
-        if (i === 0) shape.moveTo(x, y);
-        else shape.lineTo(x, y);
-      }
-      shape.closePath();
-      var geo = new THREE.ExtrudeGeometry(shape, {
-        depth: layer.thickness * zScale,
-        bevelEnabled: false,
-      });
-      var mesh = new THREE.Mesh(geo, mat);
-      mesh.rotation.x = -Math.PI / 2;
-      mesh.position.y = layer.z * zScale;
-      group.add(mesh);
-    });
-    scene.add(group);
-
-    var el = document.createElement('div');
-    el.className = 'leg';
-    el.innerHTML = '<div class="leg-dot" style="background:' + layer.color + '"></div>' + layer.name + ' (' + layer.polygons.length + ')';
-    el.addEventListener('click', function() {
-      group.visible = !group.visible;
-      el.classList.toggle('off');
-    });
-    legend.appendChild(el);
-  });
-
-  var maxDim = Math.max(die.w, die.h) * scale;
-  camera.position.set(maxDim * 0.8, maxDim * 0.6, maxDim * 0.8);
-  controls.target.set(0, 2, 0);
-  controls.update();
-
-  var info = document.getElementById('info-text');
-  info.textContent = die.w.toFixed(1) + ' x ' + die.h.toFixed(1) + ' um | ' +
-    data.layers.reduce(function(s,l){ return s + l.polygons.length; }, 0) + ' polygons | ' +
-    data.layers.length + ' layers';
-}
-
-function animate() {
-  requestAnimationFrame(animate);
-  controls.update();
-  renderer.render(scene, camera);
-}
-animate();
-
-window.addEventListener('resize', function() {
-  camera.aspect = window.innerWidth / window.innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
-});
-
-// MCP Apps bridge
-if (window.parent !== window) {
-  window.addEventListener('message', function(e) {
-    if (e.data && e.data.type === 'ui/notifications/tool-result' && e.data.structuredContent) {
-      if (e.data.structuredContent.layout3d) buildScene(e.data.structuredContent.layout3d);
-    }
-  });
-  window.parent.postMessage({ type: 'ui/initialize', version: '1.0' }, '*');
-}
-// ChatGPT Apps SDK
-if (window.openai && window.openai.toolOutput && window.openai.toolOutput.layout3d) buildScene(window.openai.toolOutput.layout3d);
-window.addEventListener('openai:set_globals', function(e) {
-  if (e.detail && e.detail.globals && e.detail.globals.toolOutput && e.detail.globals.toolOutput.layout3d)
-    buildScene(e.detail.globals.toolOutput.layout3d);
-});
-// URL params fallback
-try {
-  var p = new URLSearchParams(window.location.search);
-  if (p.get('mcpUseParams')) { var d = JSON.parse(decodeURIComponent(p.get('mcpUseParams'))); if (d.layout3d) buildScene(d.layout3d); }
-} catch(e) {}
-</script>
-</body>
-</html>`;
-
-const CHIP_RESULT_HTML = `<!DOCTYPE html>
-<html>
-<head>
-<style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 16px; background: var(--color-bg, #fff); color: var(--color-text, #1a1a2e); }
-  .card { border: 1px solid var(--color-border, #e0e0e0); border-radius: 12px; padding: 20px; max-width: 480px; }
-  .header { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
-  .chip-icon { width: 36px; height: 36px; background: #16213e; border-radius: 8px; display: flex; align-items: center; justify-content: center; color: #00d4ff; font-size: 18px; font-weight: bold; }
-  .title { font-size: 18px; font-weight: 600; }
-  .subtitle { font-size: 12px; color: #666; }
-  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 16px; }
-  .stat { background: var(--color-surface, #f5f5f5); padding: 10px 12px; border-radius: 8px; }
-  .stat-label { font-size: 11px; text-transform: uppercase; color: #888; letter-spacing: 0.5px; }
-  .stat-value { font-size: 16px; font-weight: 600; margin-top: 2px; }
-  .download-btn { display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%; padding: 12px; background: #16213e; color: #fff; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; transition: background 0.2s; }
-  .download-btn:hover { background: #1a2744; }
-  .download-btn:disabled { background: #999; cursor: not-allowed; }
-  .download-btn svg { width: 18px; height: 18px; }
-  .no-gds { text-align: center; padding: 8px; color: #888; font-size: 13px; }
-</style>
-</head>
-<body>
-<div class="card" id="root">
-  <div class="header">
-    <div class="chip-icon">IC</div>
-    <div>
-      <div class="title" id="design-name">Chip Design</div>
-      <div class="subtitle" id="pdk-info">Sky130 130nm</div>
-    </div>
-  </div>
-  <div class="stats" id="stats-grid"></div>
-  <div id="download-area"></div>
-</div>
-<script>
-function render(props) {
-  if (!props) return;
-  if (props.designName) document.getElementById('design-name').textContent = props.designName;
-  if (props.pdk) document.getElementById('pdk-info').textContent = props.pdk;
-  const grid = document.getElementById('stats-grid');
-  grid.innerHTML = '';
-  const entries = [
-    ['Cells', props.cells],
-    ['Area', props.area],
-    ['Timing (WNS)', props.wns],
-    ['Runtime', props.duration],
-  ].filter(e => e[1]);
-  entries.forEach(([label, value]) => {
-    grid.innerHTML += '<div class="stat"><div class="stat-label">' + label + '</div><div class="stat-value">' + value + '</div></div>';
-  });
-  const dlArea = document.getElementById('download-area');
-  if (props.gdsii_base64) {
-    dlArea.innerHTML = '<button class="download-btn" id="dl-btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Download GDSII</button>';
-    document.getElementById('dl-btn').addEventListener('click', function() {
-      var raw = atob(props.gdsii_base64);
-      var bytes = new Uint8Array(raw.length);
-      for (var i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
-      var blob = new Blob([bytes], { type: 'application/octet-stream' });
-      var url = URL.createObjectURL(blob);
-      var a = document.createElement('a');
-      a.href = url;
-      a.download = (props.filename || 'design') + '.gds';
-      document.body.appendChild(a);
-      a.click();
-      URL.revokeObjectURL(url);
-      a.remove();
-    });
-  } else {
-    dlArea.innerHTML = '<div class="no-gds">GDSII not generated. Use design-chip-signoff for downloadable layout.</div>';
-  }
-}
-// MCP Apps bridge (Claude, Cursor)
-if (window.parent !== window) {
-  window.addEventListener('message', function(e) {
-    if (e.data && e.data.type === 'ui/notifications/tool-result' && e.data.structuredContent) {
-      render(e.data.structuredContent);
-    }
-  });
-  window.parent.postMessage({ type: 'ui/initialize', version: '1.0' }, '*');
-}
-// ChatGPT Apps SDK
-if (window.openai && window.openai.toolOutput) render(window.openai.toolOutput);
-window.addEventListener('openai:set_globals', function(e) {
-  if (e.detail && e.detail.globals && e.detail.globals.toolOutput) render(e.detail.globals.toolOutput);
-});
-// URL params fallback (dev inspector)
-try {
-  var p = new URLSearchParams(window.location.search);
-  if (p.get('mcpUseParams')) render(JSON.parse(decodeURIComponent(p.get('mcpUseParams'))));
-} catch(e) {}
-</script>
-</body>
-</html>`;
-
 const server = new MCPServer({
   name: "zyphar-eda",
   title: "Zyphar EDA - Chip Design from Chat",
   version: "1.0.0",
   description: "Design chips from chat. Full RTL-to-GDSII: synthesis, place & route, timing, DRC, LVS. Supports Sky130, GF180MCU, ASAP7 PDKs.",
   baseUrl: process.env.MCP_URL || "http://localhost:3000",
-});
-
-server.uiResource({
-  type: "rawHtml",
-  name: "chip-design-result",
-  title: "Chip Design Result",
-  description: "Interactive chip design results with GDSII download",
-  htmlContent: CHIP_RESULT_HTML,
-});
-
-server.uiResource({
-  type: "rawHtml",
-  name: "chip-3d-viewer",
-  title: "3D Chip Layout Viewer",
-  description: "Interactive 3D visualization of chip layout layers using Three.js",
-  htmlContent: CHIP_3D_HTML,
 });
 
 server.tool(
@@ -584,6 +324,11 @@ server.tool(
     schema: z.object({
       job_dir: z.string().describe("The job directory from a previous design-chip run (shown in the output path)"),
     }),
+    widget: {
+      name: "chip-layout",
+      invoking: "Rendering chip layout...",
+      invoked: "Chip layout rendered",
+    },
   },
   async ({ job_dir }) => {
     const layout3d = await extract3DLayout(job_dir);
@@ -594,7 +339,16 @@ server.tool(
     const summary = `Chip Layout: ${layout3d.die.w.toFixed(1)} x ${layout3d.die.h.toFixed(1)} um die, ${layout3d.layers.length} layers, ${totalPolys} polygons`;
     const pngB64 = await renderLayoutPng(job_dir);
     if (pngB64) {
-      return mix(image(pngB64, "image/png"), text(summary));
+      return widget({
+        props: {
+          image_base64: pngB64,
+          die_w: layout3d.die.w,
+          die_h: layout3d.die.h,
+          layers: layout3d.layers.length,
+          polygons: totalPolys,
+        },
+        output: text(summary),
+      });
     }
     return text(summary + "\n(Image rendering failed -- PIL may not be installed on EC2)");
   }
