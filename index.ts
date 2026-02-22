@@ -105,6 +105,175 @@ async function getGdsiiBase64(jobDir: string, top: string): Promise<string | nul
   }
 }
 
+async function extract3DLayout(jobDir: string): Promise<any | null> {
+  try {
+    const gdsFile = (await runOnEC2(
+      `find ${jobDir}/output -name "*.gds" 2>/dev/null | head -1`
+    )).trim();
+    if (!gdsFile) return null;
+    const jsonPath = `${jobDir}/output/layout_3d.json`;
+    const result = await runOnEC2(
+      `GDS_PATH=${gdsFile} OUT_PATH=${jsonPath} klayout -b -r /tmp/extract_3d.py 2>&1`,
+      30000
+    );
+    if (!result.includes("OK")) return null;
+    const json = await runOnEC2(`cat ${jsonPath}`);
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}
+
+const CHIP_3D_HTML = `<!DOCTYPE html>
+<html>
+<head>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #1a1a2e; overflow: hidden; }
+  #canvas { width: 100%; height: 100%; display: block; }
+  #info { position: absolute; top: 8px; left: 8px; color: #ccc; font: 12px -apple-system, sans-serif; pointer-events: none; }
+  #info span { background: rgba(0,0,0,0.6); padding: 2px 6px; border-radius: 4px; }
+  #legend { position: absolute; bottom: 8px; left: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
+  .leg { font: 10px -apple-system, sans-serif; color: #ccc; display: flex; align-items: center; gap: 3px; background: rgba(0,0,0,0.5); padding: 2px 6px; border-radius: 3px; cursor: pointer; user-select: none; }
+  .leg.off { opacity: 0.3; }
+  .leg-dot { width: 8px; height: 8px; border-radius: 2px; }
+  #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); color: #888; font: 14px sans-serif; }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="info"><span id="info-text">Drag to rotate, scroll to zoom</span></div>
+<div id="legend" id="legend"></div>
+<div id="loading">Loading 3D layout...</div>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const canvas = document.getElementById('canvas');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setClearColor(0x1a1a2e);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.01, 10000);
+const controls = new OrbitControls(camera, canvas);
+controls.enableDamping = true;
+controls.dampingFactor = 0.1;
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight.position.set(1, 2, 1);
+scene.add(dirLight);
+
+const layerGroups = {};
+
+function buildScene(data) {
+  document.getElementById('loading').style.display = 'none';
+  const die = data.die;
+  const cx = die.x + die.w / 2, cy = die.y + die.h / 2;
+  const scale = 100 / Math.max(die.w, die.h);
+  const zScale = scale * 150;
+
+  // Substrate
+  const subGeo = new THREE.BoxGeometry(die.w * scale, 0.5, die.h * scale);
+  const subMat = new THREE.MeshPhongMaterial({ color: 0x2a2a3a });
+  const sub = new THREE.Mesh(subGeo, subMat);
+  sub.position.set(0, -0.3, 0);
+  scene.add(sub);
+
+  const legend = document.getElementById('legend');
+  data.layers.forEach(function(layer) {
+    var color = parseInt(layer.color.replace('#',''), 16);
+    var mat = new THREE.MeshPhongMaterial({
+      color: color,
+      transparent: true,
+      opacity: layer.opacity,
+      side: THREE.DoubleSide,
+    });
+    var group = new THREE.Group();
+    group.name = layer.name;
+    layerGroups[layer.name] = group;
+
+    layer.polygons.forEach(function(pts) {
+      var shape = new THREE.Shape();
+      for (var i = 0; i < pts.length; i++) {
+        var x = (pts[i][0] - cx) * scale;
+        var y = (pts[i][1] - cy) * scale;
+        if (i === 0) shape.moveTo(x, y);
+        else shape.lineTo(x, y);
+      }
+      shape.closePath();
+      var geo = new THREE.ExtrudeGeometry(shape, {
+        depth: layer.thickness * zScale,
+        bevelEnabled: false,
+      });
+      var mesh = new THREE.Mesh(geo, mat);
+      mesh.rotation.x = -Math.PI / 2;
+      mesh.position.y = layer.z * zScale;
+      group.add(mesh);
+    });
+    scene.add(group);
+
+    var el = document.createElement('div');
+    el.className = 'leg';
+    el.innerHTML = '<div class="leg-dot" style="background:' + layer.color + '"></div>' + layer.name + ' (' + layer.polygons.length + ')';
+    el.addEventListener('click', function() {
+      group.visible = !group.visible;
+      el.classList.toggle('off');
+    });
+    legend.appendChild(el);
+  });
+
+  var maxDim = Math.max(die.w, die.h) * scale;
+  camera.position.set(maxDim * 0.8, maxDim * 0.6, maxDim * 0.8);
+  controls.target.set(0, 2, 0);
+  controls.update();
+
+  var info = document.getElementById('info-text');
+  info.textContent = die.w.toFixed(1) + ' x ' + die.h.toFixed(1) + ' um | ' +
+    data.layers.reduce(function(s,l){ return s + l.polygons.length; }, 0) + ' polygons | ' +
+    data.layers.length + ' layers';
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+window.addEventListener('resize', function() {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// MCP Apps bridge
+if (window.parent !== window) {
+  window.addEventListener('message', function(e) {
+    if (e.data && e.data.type === 'ui/notifications/tool-result' && e.data.structuredContent) {
+      if (e.data.structuredContent.layout3d) buildScene(e.data.structuredContent.layout3d);
+    }
+  });
+  window.parent.postMessage({ type: 'ui/initialize', version: '1.0' }, '*');
+}
+// ChatGPT Apps SDK
+if (window.openai && window.openai.toolOutput && window.openai.toolOutput.layout3d) buildScene(window.openai.toolOutput.layout3d);
+window.addEventListener('openai:set_globals', function(e) {
+  if (e.detail && e.detail.globals && e.detail.globals.toolOutput && e.detail.globals.toolOutput.layout3d)
+    buildScene(e.detail.globals.toolOutput.layout3d);
+});
+// URL params fallback
+try {
+  var p = new URLSearchParams(window.location.search);
+  if (p.get('mcpUseParams')) { var d = JSON.parse(decodeURIComponent(p.get('mcpUseParams'))); if (d.layout3d) buildScene(d.layout3d); }
+} catch(e) {}
+</script>
+</body>
+</html>`;
+
 const CHIP_RESULT_HTML = `<!DOCTYPE html>
 <html>
 <head>
@@ -215,6 +384,14 @@ server.uiResource({
   htmlContent: CHIP_RESULT_HTML,
 });
 
+server.uiResource({
+  type: "rawHtml",
+  name: "chip-3d-viewer",
+  title: "3D Chip Layout Viewer",
+  description: "Interactive 3D visualization of chip layout layers using Three.js",
+  htmlContent: CHIP_3D_HTML,
+});
+
 server.tool(
   {
     name: "design-chip",
@@ -253,6 +430,7 @@ server.tool(
         duration: stats.duration || "N/A",
         gdsii_base64: gdsii_base64,
         filename: top,
+        jobDir: jobDir,
       },
       output: text(output),
     });
@@ -384,6 +562,35 @@ server.tool(
 
 server.tool(
   {
+    name: "view-chip-3d",
+    description: "Render an interactive 3D visualization of a chip layout. Extracts real polygon data from the GDSII file using KLayout and displays it as a rotatable, zoomable 3D model with all physical layers (diffusion, poly, metal1-5, vias). Call this AFTER design-chip or design-chip-signoff to visualize the result.",
+    schema: z.object({
+      job_dir: z.string().describe("The job directory from a previous design-chip run (shown in the output path)"),
+    }),
+    widget: {
+      name: "chip-3d-viewer",
+      invoking: "Rendering 3D layout...",
+      invoked: "3D layout ready",
+    },
+  },
+  async ({ job_dir }) => {
+    const layout3d = await extract3DLayout(job_dir);
+    if (!layout3d) {
+      return text("No GDSII file found. Run design-chip with --gds first.");
+    }
+    const totalPolys = layout3d.layers.reduce((s: number, l: any) => s + l.polygons.length, 0);
+    return widget({
+      props: { layout3d },
+      output: text(
+        `3D Layout: ${layout3d.die.w.toFixed(1)} x ${layout3d.die.h.toFixed(1)} um die, ` +
+        `${layout3d.layers.length} layers, ${totalPolys} polygons`
+      ),
+    });
+  }
+);
+
+server.tool(
+  {
     name: "simulate",
     description: "Simulate a Verilog design with a testbench using Icarus Verilog. Proves functional correctness -- does the design actually do what it should? Returns simulation output including $display/$monitor messages. The testbench should use $finish to end simulation.",
     schema: z.object({
@@ -466,7 +673,8 @@ WORKFLOW -- follow these steps in order:
 3. Call "simulate" with both the design and testbench. This proves functional correctness.
 4. Call "fpga-synthesize" to show it maps to real FPGA hardware (LUTs, flip-flops).
 5. Call "design-chip" to run full ASIC synthesis + place & route. This produces a physical chip layout.
-6. Present all results: simulation PASS/FAIL, FPGA resources, ASIC cell count, die area, timing.
+6. Call "view-chip-3d" with the job directory from the design-chip output to show an interactive 3D visualization.
+7. Present all results: simulation PASS/FAIL, FPGA resources, ASIC cell count, die area, timing, 3D layout.
 
 VERILOG RULES:
 - Use "always @(posedge clk)" for sequential logic, "always @(*)" for combinational
@@ -490,6 +698,7 @@ AVAILABLE TOOLS:
 - estimate-ppa: Instant PPA estimate from cell count.
 - run-demo-design: Run a known-good design (picorv32, uart_tx, alu_8bit).
 - design-chip-signoff: Full flow + DRC + LVS verification for manufacturing readiness.
+- view-chip-3d: Interactive 3D visualization of the chip layout. Call AFTER design-chip. Pass the job directory path.
 
 The user wants to design: ${description || "a chip (ask them what kind)"}`,
           },
