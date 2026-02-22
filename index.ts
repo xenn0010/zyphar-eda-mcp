@@ -584,11 +584,6 @@ server.tool(
     schema: z.object({
       job_dir: z.string().describe("The job directory from a previous design-chip run (shown in the output path)"),
     }),
-    widget: {
-      name: "chip-3d-viewer",
-      invoking: "Rendering 3D layout...",
-      invoked: "3D layout ready",
-    },
   },
   async ({ job_dir }) => {
     const layout3d = await extract3DLayout(job_dir);
@@ -596,18 +591,12 @@ server.tool(
       return text("No GDSII file found. Run design-chip first.");
     }
     const totalPolys = layout3d.layers.reduce((s: number, l: any) => s + l.polygons.length, 0);
-    const summary = `3D Layout: ${layout3d.die.w.toFixed(1)} x ${layout3d.die.h.toFixed(1)} um die, ${layout3d.layers.length} layers, ${totalPolys} polygons`;
+    const summary = `Chip Layout: ${layout3d.die.w.toFixed(1)} x ${layout3d.die.h.toFixed(1)} um die, ${layout3d.layers.length} layers, ${totalPolys} polygons`;
     const pngB64 = await renderLayoutPng(job_dir);
     if (pngB64) {
-      return widget({
-        props: { layout3d },
-        output: mix(image(pngB64, "image/png"), text(summary)),
-      });
+      return mix(image(pngB64, "image/png"), text(summary));
     }
-    return widget({
-      props: { layout3d },
-      output: text(summary),
-    });
+    return text(summary + "\n(Image rendering failed -- PIL may not be installed on EC2)");
   }
 );
 
