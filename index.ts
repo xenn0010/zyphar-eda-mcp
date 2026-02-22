@@ -175,7 +175,7 @@ server.tool(
       600000
     );
     const stats = parseDesignStats(output);
-    const gdsii_base64 = await getGdsiiBase64(jobDir, top);
+    const hasGds = await runOnEC2(`find ${jobDir}/output -name "*.gds" 2>/dev/null | head -1`).then(r => r.trim().length > 0).catch(() => false);
     const pdkLabel: Record<string, string> = { sky130: "Sky130 130nm", gf180mcu: "GF180MCU 180nm", asap7: "ASAP7 7nm" };
     return widget({
       props: {
@@ -185,9 +185,9 @@ server.tool(
         area: stats.area || "N/A",
         wns: stats.wns || "N/A",
         duration: stats.duration || "N/A",
-        gdsii_base64: gdsii_base64,
-        filename: top,
+        hasGds: hasGds,
         jobDir: jobDir,
+        filename: top,
       },
       output: text(output),
     });
@@ -299,7 +299,7 @@ server.tool(
       600000
     );
     const stats = parseDesignStats(output);
-    const gdsii_base64 = await getGdsiiBase64(jobDir, top);
+    const hasGds = await runOnEC2(`find ${jobDir}/output -name "*.gds" 2>/dev/null | head -1`).then(r => r.trim().length > 0).catch(() => false);
     const pdkLabel: Record<string, string> = { sky130: "Sky130 130nm", gf180mcu: "GF180MCU 180nm", asap7: "ASAP7 7nm" };
     return widget({
       props: {
@@ -309,7 +309,8 @@ server.tool(
         area: stats.area || "N/A",
         wns: stats.wns || "N/A",
         duration: stats.duration || "N/A",
-        gdsii_base64: gdsii_base64,
+        hasGds: hasGds,
+        jobDir: jobDir,
         filename: top,
       },
       output: text(output),
@@ -351,6 +352,30 @@ server.tool(
       });
     }
     return text(summary + "\n(Image rendering failed -- PIL may not be installed on EC2)");
+  }
+);
+
+server.tool(
+  {
+    name: "download-gdsii",
+    description: "Download the GDSII layout file from a completed chip design job. Returns the file as a base64-encoded data URL that can be saved. Called by the chip-design-result widget when the user clicks Download.",
+    schema: z.object({
+      job_dir: z.string().describe("The job directory from a previous design-chip run"),
+      filename: z.string().default("design").describe("Base filename for the downloaded .gds file"),
+    }),
+  },
+  async ({ job_dir, filename }) => {
+    const b64 = await getGdsiiBase64(job_dir, filename);
+    if (!b64) {
+      return text("No GDSII file found in " + job_dir);
+    }
+    return {
+      content: [{ type: "text" as const, text: `GDSII file ready: ${filename}.gds` }],
+      structuredContent: {
+        dataUrl: `data:application/octet-stream;base64,${b64}`,
+        filename: `${filename}.gds`,
+      },
+    };
   }
 );
 

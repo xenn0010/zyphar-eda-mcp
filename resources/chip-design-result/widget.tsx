@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useState } from "react";
 import { useWidget, McpUseProvider } from "mcp-use/react";
 
 interface ChipDesignProps {
@@ -8,12 +8,14 @@ interface ChipDesignProps {
   area?: string;
   wns?: string;
   duration?: string;
-  gdsii_base64?: string;
+  hasGds?: boolean;
+  jobDir?: string;
   filename?: string;
 }
 
 const ChipDesignResult: React.FC = () => {
-  const { props, isPending, theme } = useWidget<ChipDesignProps>();
+  const { props, isPending, theme, callTool, openExternal } = useWidget<ChipDesignProps>();
+  const [downloading, setDownloading] = useState(false);
 
   if (isPending) {
     return (
@@ -34,29 +36,32 @@ const ChipDesignResult: React.FC = () => {
 
   const isDark = theme === "dark";
   const bg = isDark ? "#1a1a2e" : "#ffffff";
-  const text = isDark ? "#e0e0e0" : "#1a1a2e";
+  const textColor = isDark ? "#e0e0e0" : "#1a1a2e";
   const surface = isDark ? "#2a2a3e" : "#f5f5f5";
   const border = isDark ? "#3a3a4e" : "#e0e0e0";
 
-  const handleDownload = () => {
-    if (!props.gdsii_base64) return;
-    const raw = atob(props.gdsii_base64);
-    const bytes = new Uint8Array(raw.length);
-    for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
-    const blob = new Blob([bytes], { type: "application/octet-stream" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = (props.filename || "design") + ".gds";
-    document.body.appendChild(a);
-    a.click();
-    URL.revokeObjectURL(url);
-    a.remove();
+  const handleDownload = async () => {
+    if (!props.jobDir || downloading) return;
+    setDownloading(true);
+    try {
+      const res = await callTool("download-gdsii", {
+        job_dir: props.jobDir,
+        filename: props.filename || "design",
+      });
+      const sc = res?.structuredContent as Record<string, string> | undefined;
+      if (sc?.dataUrl) {
+        openExternal(sc.dataUrl);
+      }
+    } catch (err) {
+      console.error("Download failed:", err);
+    } finally {
+      setDownloading(false);
+    }
   };
 
   return (
     <McpUseProvider autoSize>
-      <div style={{ padding: 16, fontFamily: "system-ui, sans-serif", color: text, background: bg }}>
+      <div style={{ padding: 16, fontFamily: "system-ui, sans-serif", color: textColor, background: bg }}>
         <div
           style={{
             border: `1px solid ${border}`,
@@ -106,9 +111,10 @@ const ChipDesignResult: React.FC = () => {
             ))}
           </div>
 
-          {props.gdsii_base64 ? (
+          {props.hasGds ? (
             <button
               onClick={handleDownload}
+              disabled={downloading}
               style={{
                 display: "flex",
                 alignItems: "center",
@@ -116,21 +122,28 @@ const ChipDesignResult: React.FC = () => {
                 gap: 8,
                 width: "100%",
                 padding: 12,
-                background: "#16213e",
+                background: downloading ? "#2a3a5e" : "#16213e",
                 color: "#fff",
                 border: "none",
                 borderRadius: 8,
                 fontSize: 14,
                 fontWeight: 600,
-                cursor: "pointer",
+                cursor: downloading ? "wait" : "pointer",
+                opacity: downloading ? 0.7 : 1,
               }}
             >
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                <polyline points="7 10 12 15 17 10" />
-                <line x1="12" y1="15" x2="12" y2="3" />
-              </svg>
-              Download GDSII
+              {downloading ? (
+                "Downloading..."
+              ) : (
+                <>
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                    <polyline points="7 10 12 15 17 10" />
+                    <line x1="12" y1="15" x2="12" y2="3" />
+                  </svg>
+                  Download GDSII
+                </>
+              )}
             </button>
           ) : (
             <div style={{ textAlign: "center", padding: 8, color: "#888", fontSize: 13 }}>
