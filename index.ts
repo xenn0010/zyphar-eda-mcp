@@ -17,7 +17,7 @@ function getSSHKey(): string {
   return readFileSync(keyPath, "utf-8");
 }
 
-function runOnEC2(cmd: string, timeoutMs = 1800000): Promise<string> {
+function runOnEC2Raw(cmd: string, timeoutMs = 1800000): Promise<string> {
   return new Promise((resolve, reject) => {
     const conn = new Client();
     let output = "";
@@ -64,6 +64,11 @@ function runOnEC2(cmd: string, timeoutMs = 1800000): Promise<string> {
   });
 }
 
+async function runOnEC2(cmd: string, timeoutMs = 1800000): Promise<string> {
+  const raw = await runOnEC2Raw(cmd, timeoutMs);
+  return sanitizeOutput(raw);
+}
+
 async function uploadFile(filename: string, content: string, dir?: string): Promise<string> {
   const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
   const jobDir = dir || `/tmp/mcp_jobs/${jobId}`;
@@ -108,6 +113,30 @@ async function uploadFile(filename: string, content: string, dir?: string): Prom
       readyTimeout: 15000,
     });
   });
+}
+
+function sanitizeOutput(output: string): string {
+  return output
+    .replace(/Yosys \d+\.\d+[^\n]*/g, "Zyphar Synthesis Engine")
+    .replace(/yosys>/g, "zyphar>")
+    .replace(/Yosys/g, "Zyphar")
+    .replace(/yosys/g, "zyphar")
+    .replace(/OpenROAD [^\n]*/g, "Zyphar PnR Engine")
+    .replace(/OpenROAD/g, "Zyphar PnR")
+    .replace(/openroad/g, "zyphar-pnr")
+    .replace(/OpenSTA [^\n]*/g, "Zyphar Timing Engine")
+    .replace(/OpenSTA/g, "Zyphar STA")
+    .replace(/KLayout [^\n]*/g, "Zyphar Layout Engine")
+    .replace(/KLayout/g, "Zyphar Layout")
+    .replace(/klayout/g, "zyphar-layout")
+    .replace(/Icarus Verilog/g, "Zyphar Simulator")
+    .replace(/iverilog/g, "zyphar-sim")
+    .replace(/Verilator [^\n]*/g, "Zyphar Lint Engine")
+    .replace(/Verilator/g, "Zyphar Lint")
+    .replace(/verilator/g, "zyphar-lint")
+    .replace(/OpenRAM/g, "Zyphar Memory Compiler")
+    .replace(/ABC:/g, "Optimizer:")
+    .replace(/ABC /g, "Optimizer ");
 }
 
 function extractTopModule(verilog: string): string {
@@ -273,7 +302,7 @@ const server = new MCPServer({
 server.tool(
   {
     name: "design-chip",
-    description: "Start the full RTL-to-GDSII chip design flow on Verilog source code. Launches synthesis (Yosys) + place & route (OpenROAD) as a background job and returns immediately with a job directory. Use get-job-status to poll for results.",
+    description: "Start the full RTL-to-GDSII chip design flow on Verilog source code. Launches synthesis + place & route as a background job and returns immediately with a job directory. Use get-job-status to poll for results.",
     schema: z.object({
       verilog: z.string().describe("Complete Verilog source code for the design"),
       top_module: z.string().optional().describe("Top-level module name. Auto-detected from Verilog if omitted."),
@@ -331,7 +360,7 @@ server.tool(
 server.tool(
   {
     name: "synthesize",
-    description: "Synthesize Verilog source code to a gate-level netlist using Yosys. Returns cell count, area breakdown, and the synthesized netlist. Faster than full design-chip since it skips place & route.",
+    description: "Synthesize Verilog source code to a gate-level netlist. Returns cell count, area breakdown, and the synthesized netlist. Faster than full design-chip since it skips place & route.",
     schema: z.object({
       verilog: z.string().describe("Complete Verilog source code"),
       top_module: z.string().optional().describe("Top-level module name. Auto-detected from Verilog if omitted."),
@@ -473,7 +502,7 @@ server.tool(
 server.tool(
   {
     name: "view-chip-3d",
-    description: "Render an interactive 3D visualization of a chip layout. Extracts real polygon data from the GDSII file using KLayout and displays it as a rotatable, zoomable 3D model with all physical layers (diffusion, poly, metal1-5, vias). Call this AFTER design-chip or design-chip-signoff to visualize the result.",
+    description: "Render an interactive 3D visualization of a chip layout. Extracts real polygon data from the GDSII file and displays it as a rotatable, zoomable 3D model with all physical layers (diffusion, poly, metal1-5, vias). Call this AFTER design-chip or design-chip-signoff to visualize the result.",
     schema: z.object({
       job_dir: z.string().describe("The job directory from a previous design-chip run (shown in the output path)"),
     }),
@@ -534,7 +563,7 @@ server.tool(
 server.tool(
   {
     name: "simulate",
-    description: "Simulate a Verilog design with a testbench using Icarus Verilog. Proves functional correctness -- does the design actually do what it should? Returns simulation output including $display/$monitor messages. The testbench should use $finish to end simulation.",
+    description: "Simulate a Verilog design with a testbench. Proves functional correctness -- does the design actually do what it should? Returns simulation output including $display/$monitor messages. The testbench should use $finish to end simulation.",
     schema: z.object({
       verilog: z.string().describe("Complete Verilog source code for the design under test"),
       testbench: z.string().describe("Verilog testbench that instantiates the design, drives inputs, and checks outputs using $display and $finish"),
@@ -557,7 +586,7 @@ server.tool(
 server.tool(
   {
     name: "fpga-synthesize",
-    description: "Synthesize Verilog for FPGA using Yosys. Maps the design to FPGA primitives (LUTs, flip-flops, BRAMs) and reports resource utilization. Proves the design can run on real FPGA hardware. Supported targets: ice40 (Lattice iCE40), ecp5 (Lattice ECP5), xilinx (Xilinx 7-series).",
+    description: "Synthesize Verilog for FPGA. Maps the design to FPGA primitives (LUTs, flip-flops, BRAMs) and reports resource utilization. Proves the design can run on real FPGA hardware. Supported targets: ice40 (Lattice iCE40), ecp5 (Lattice ECP5), xilinx (Xilinx 7-series).",
     schema: z.object({
       verilog: z.string().describe("Complete Verilog source code"),
       top_module: z.string().optional().describe("Top-level module name. Auto-detected if omitted."),
@@ -867,7 +896,7 @@ server.tool(
 server.tool(
   {
     name: "verify-equivalence",
-    description: "Formally verify that a gate-level netlist is logically equivalent to the original RTL. Uses Yosys equivalence checking (SAT-based). Proves synthesis did not introduce bugs.",
+    description: "Formally verify that a gate-level netlist is logically equivalent to the original RTL. Uses SAT-based equivalence checking. Proves synthesis did not introduce bugs.",
     schema: z.object({
       rtl: z.string().describe("Original RTL Verilog source code"),
       netlist: z.string().describe("Gate-level netlist to verify against RTL"),
@@ -930,7 +959,7 @@ server.tool(
 server.tool(
   {
     name: "compile-memory",
-    description: "Generate an SRAM macro using OpenRAM. Produces LEF, GDS, Liberty, and Verilog models for the specified memory configuration. Currently supports Sky130 PDK.",
+    description: "Generate an SRAM macro. Produces LEF, GDS, Liberty, and Verilog models for the specified memory configuration. Currently supports Sky130 PDK.",
     schema: z.object({
       words: z.number().describe("Number of words (rows) in the SRAM"),
       bits: z.number().describe("Number of bits per word (columns)"),
@@ -1037,7 +1066,7 @@ server.tool(
 server.tool(
   {
     name: "lint-verilog",
-    description: "Run Verilator lint checks on Verilog source code before synthesis. Catches common coding errors, undriven signals, width mismatches, and style issues. Fast pre-synthesis validation.",
+    description: "Run lint checks on Verilog source code before synthesis. Catches common coding errors, undriven signals, width mismatches, and style issues. Fast pre-synthesis validation.",
     schema: z.object({
       verilog: z.string().describe("Verilog source code to lint"),
       top_module: z.string().optional().describe("Top-level module name. Auto-detected if omitted."),
@@ -1072,7 +1101,7 @@ server.tool(
 server.tool(
   {
     name: "netlist-stats",
-    description: "Analyze a gate-level netlist or Verilog design and report statistics: cell types, hierarchy, fanout distribution, area by module. Uses Yosys stat command.",
+    description: "Analyze a gate-level netlist or Verilog design and report statistics: cell types, hierarchy, fanout distribution, area by module.",
     schema: z.object({
       job_dir: z.string().optional().describe("Job directory from a previous design-chip run (uses synthesized netlist)"),
       verilog: z.string().optional().describe("Verilog source or netlist to analyze (alternative to job_dir)"),
@@ -1167,7 +1196,7 @@ server.prompt(
           role: "user" as const,
           content: {
             type: "text" as const,
-            text: `You are a chip design assistant with access to Zyphar EDA tools that run real industry-grade synthesis (Yosys) and place & route (OpenROAD) on a cloud server.
+            text: `You are a chip design assistant with access to Zyphar EDA tools that run industry-grade synthesis and place & route on a cloud server.
 
 WORKFLOW -- follow these steps in order:
 1. Write complete, synthesizable Verilog for the user's request. Use Verilog-2005 (not SystemVerilog). Always include a clock port named "clk" for sequential designs.
@@ -1193,17 +1222,27 @@ TESTBENCH RULES:
 - End with $finish
 
 AVAILABLE TOOLS:
-- simulate: Run Verilog simulation with testbench (iverilog). Proves the design WORKS. ~1 second.
+- simulate: Run Verilog simulation with testbench. Proves the design WORKS. ~1 second.
 - fpga-synthesize: Synthesize for FPGA (iCE40/ECP5/Xilinx). Proves it runs on FPGA hardware. ~2 seconds.
-- design-chip: Start ASIC RTL-to-GDSII (Yosys + OpenROAD) as background job. Returns job_dir immediately.
+- design-chip: Start ASIC RTL-to-GDSII as background job. Returns job_dir immediately.
 - get-job-status: Poll a background job for completion. Returns results widget when done, elapsed time when running.
 - synthesize: ASIC synthesis only (faster, no layout).
 - estimate-ppa: Instant PPA estimate from cell count.
 - run-demo-design: Start a known-good design (picorv32, uart_tx, alu_8bit) as background job.
 - design-chip-signoff: Start full flow + DRC + LVS as background job.
 - view-chip-3d: Interactive 3D visualization of the chip layout. Call AFTER get-job-status shows completion.
+- analyze-timing: Static timing analysis (WNS, TNS, critical path).
+- check-drc: Design rule checking on completed layout.
+- check-lvs: Layout vs. schematic verification.
+- analyze-power: Power estimation (leakage, dynamic, total).
+- analyze-cdc: Clock domain crossing detection.
+- verify-equivalence: Formal equivalence checking (RTL vs netlist).
+- place-and-route: Standalone PnR on existing netlist.
+- lint-verilog: Pre-synthesis lint checks.
+- netlist-stats: Netlist cell/hierarchy analysis.
+- design-sweep: Multi-variant design exploration.
 
-ASYNC WORKFLOW for design-chip, run-demo-design, design-chip-signoff:
+ASYNC WORKFLOW for design-chip, run-demo-design, design-chip-signoff, place-and-route:
 1. Call the tool -- it returns instantly with a job_dir
 2. Wait ~5 seconds, then call get-job-status with that job_dir
 3. If still running, wait longer and poll again
@@ -1240,9 +1279,10 @@ Run this demo sequence:
 5. Explain that users can also write their own Verilog and have it synthesized and placed & routed in seconds using the "design-chip" tool.
 
 Key talking points:
-- This is REAL synthesis (Yosys) and place & route (OpenROAD), not simulation
-- The output is a physical chip layout (DEF file) that could be sent to a foundry
+- This is REAL synthesis and place & route, not simulation
+- The output is a physical chip layout (GDSII) that could be sent to a foundry
 - Supports 4 PDKs: Sky130 (130nm, Google/SkyWater), GF180MCU (180nm, GlobalFoundries), ASAP7 (7nm predictive), IHP SG13G2 (130nm BiCMOS, IHP GmbH)
+- Full physical verification: DRC, LVS, STA, power analysis
 - Designs from 10 cells to 50,000+ cells in seconds to minutes`,
           },
         },
