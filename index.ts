@@ -17,7 +17,7 @@ function getSSHKey(): string {
   return readFileSync(keyPath, "utf-8");
 }
 
-function runOnEC2(cmd: string, timeoutMs = 300000): Promise<string> {
+function runOnEC2(cmd: string, timeoutMs = 1800000): Promise<string> {
   return new Promise((resolve, reject) => {
     const conn = new Client();
     let output = "";
@@ -115,6 +115,90 @@ function extractTopModule(verilog: string): string {
   return match ? match[1] : "top";
 }
 
+async function startBackgroundJob(
+  jobDir: string,
+  cmd: string,
+  meta: Record<string, string> = {}
+): Promise<{ jobId: string; jobDir: string }> {
+  const jobId = jobDir.split("/").pop() || "unknown";
+  // Write metadata (design name, pdk, freq, start time)
+  const metaJson = JSON.stringify({ ...meta, startTime: Date.now(), status: "running" });
+  await runOnEC2(`mkdir -p ${jobDir}/output && echo '${metaJson}' > ${jobDir}/meta.json`, 15000);
+  // Launch the actual command in background with nohup
+  // The shell writes exit code to exit_code file when done
+  const bgCmd = `nohup bash -c '${ZYPHAR_ENV} && ${cmd} > ${jobDir}/output.log 2>&1; echo $? > ${jobDir}/exit_code' > /dev/null 2>&1 & echo $!`;
+  const pid = (await runOnEC2(bgCmd, 15000)).trim();
+  await runOnEC2(`echo '${pid}' > ${jobDir}/pid`, 10000);
+  return { jobId, jobDir };
+}
+
+interface JobStatus {
+  state: "running" | "completed" | "failed";
+  elapsedSeconds: number;
+  output?: string;
+  stats?: Record<string, string>;
+  hasGds?: boolean;
+  meta?: Record<string, string>;
+}
+
+async function checkJobStatus(jobDir: string): Promise<JobStatus> {
+  // Read metadata for start time
+  let startTime = Date.now();
+  try {
+    const metaRaw = await runOnEC2(`cat ${jobDir}/meta.json 2>/dev/null || echo '{}'`, 10000);
+    const meta = JSON.parse(metaRaw.trim());
+    if (meta.startTime) startTime = meta.startTime;
+  } catch { /* use current time as fallback */ }
+
+  const elapsedSeconds = Math.round((Date.now() - startTime) / 1000);
+
+  // Check if exit_code file exists (means job finished)
+  const exitCheck = (await runOnEC2(
+    `[ -f ${jobDir}/exit_code ] && echo "DONE:$(cat ${jobDir}/exit_code)" || echo "RUNNING"`,
+    10000
+  )).trim();
+
+  if (exitCheck === "RUNNING") {
+    // Check if process is still alive
+    let processAlive = false;
+    try {
+      const pidRaw = (await runOnEC2(`cat ${jobDir}/pid 2>/dev/null || echo ""`, 10000)).trim();
+      if (pidRaw) {
+        const psCheck = (await runOnEC2(`kill -0 ${pidRaw} 2>/dev/null && echo "ALIVE" || echo "DEAD"`, 10000)).trim();
+        processAlive = psCheck === "ALIVE";
+      }
+    } catch { /* ignore */ }
+
+    if (!processAlive) {
+      // Process died without writing exit_code -- check if log exists
+      try {
+        const tailLog = await runOnEC2(`tail -20 ${jobDir}/output.log 2>/dev/null || echo "No log file"`, 10000);
+        return { state: "failed", elapsedSeconds, output: `Process died unexpectedly.\nLast log lines:\n${tailLog.trim()}` };
+      } catch {
+        return { state: "failed", elapsedSeconds, output: "Process died unexpectedly. No log available." };
+      }
+    }
+    return { state: "running", elapsedSeconds };
+  }
+
+  // Job finished -- parse exit code
+  const exitCode = exitCheck.replace("DONE:", "").trim();
+  const output = await runOnEC2(`cat ${jobDir}/output.log 2>/dev/null || echo ""`, 30000);
+
+  if (exitCode !== "0") {
+    const lastLines = output.split("\n").slice(-30).join("\n");
+    return { state: "failed", elapsedSeconds, output: `Exit code ${exitCode}.\n${lastLines}` };
+  }
+
+  // Success -- parse stats and check for GDS
+  const stats = parseDesignStats(output);
+  const hasGds = await runOnEC2(
+    `find ${jobDir}/output -name "*.gds" 2>/dev/null | head -1`
+  ).then(r => r.trim().length > 0).catch(() => false);
+
+  return { state: "completed", elapsedSeconds, output, stats, hasGds };
+}
+
 function parseDesignStats(output: string): Record<string, string> {
   const stats: Record<string, string> = {};
   for (const line of output.split("\n")) {
@@ -189,7 +273,7 @@ const server = new MCPServer({
 server.tool(
   {
     name: "design-chip",
-    description: "Run the full RTL-to-GDSII chip design flow on Verilog source code. Runs synthesis (Yosys), place & route (OpenROAD), and generates a physical layout with downloadable GDSII file. Returns cell count, die area, timing (WNS), and an interactive results card with download button.",
+    description: "Start the full RTL-to-GDSII chip design flow on Verilog source code. Launches synthesis (Yosys) + place & route (OpenROAD) as a background job and returns immediately with a job directory. Use get-job-status to poll for results.",
     schema: z.object({
       verilog: z.string().describe("Complete Verilog source code for the design"),
       top_module: z.string().optional().describe("Top-level module name. Auto-detected from Verilog if omitted."),
@@ -197,54 +281,32 @@ server.tool(
       freq_mhz: z.number().default(100).describe("Target clock frequency in MHz"),
       clock_port: z.string().default("clk").describe("Name of the clock port in the design"),
     }),
-    widget: {
-      name: "chip-design-result",
-      invoking: "Designing chip...",
-      invoked: "Chip design complete",
-    },
   },
   async ({ verilog, top_module, pdk, freq_mhz, clock_port }) => {
     const top = top_module || extractTopModule(verilog);
     const inputPath = await uploadFile("input.v", verilog);
     const jobDir = inputPath.replace("/input.v", "");
-    const output = await runOnEC2(
-      `./target/release/zyphar flow -i ${inputPath} --top ${top} --pdk ${pdk} --freq ${freq_mhz} --clock ${clock_port} --no-pdn --util 0.45 --gds --output ${jobDir}/output 2>&1`,
-      600000
-    );
-    const stats = parseDesignStats(output);
-    const hasGds = await runOnEC2(`find ${jobDir}/output -name "*.gds" 2>/dev/null | head -1`).then(r => r.trim().length > 0).catch(() => false);
-    const pdkLabel: Record<string, string> = { sky130: "Sky130 130nm", gf180mcu: "GF180MCU 180nm", asap7: "ASAP7 7nm" };
-    return widget({
-      props: {
-        designName: top,
-        pdk: pdkLabel[pdk] || pdk,
-        cells: stats.cells || stats.instances || "N/A",
-        area: stats.area || "N/A",
-        wns: stats.wns || "N/A",
-        duration: stats.duration || "N/A",
-        hasGds: hasGds,
-        jobDir: jobDir,
-        filename: top,
-      },
-      output: text(output),
+    const flowCmd = `./target/release/zyphar flow -i ${inputPath} --top ${top} --pdk ${pdk} --freq ${freq_mhz} --clock ${clock_port} --no-pdn --util 0.45 --gds --output ${jobDir}/output`;
+    const { jobDir: jd } = await startBackgroundJob(jobDir, flowCmd, {
+      designName: top, pdk, freq: String(freq_mhz), tool: "design-chip",
     });
+    return text(
+      `Job started. Design: ${top}, PDK: ${pdk}, Freq: ${freq_mhz} MHz\n` +
+      `Job directory: ${jd}\n\n` +
+      `Use get-job-status with job_dir="${jd}" to check progress and get results.`
+    );
   }
 );
 
 server.tool(
   {
     name: "run-demo-design",
-    description: "Run a pre-validated demo design through the full chip design flow. Available designs: picorv32 (RISC-V CPU, ~14K cells), uart_tx (UART transmitter, ~100 cells), alu_8bit (8-bit ALU, ~255 cells). All are DRC/LVS clean on Sky130.",
+    description: "Start a pre-validated demo design as a background job. Available designs: picorv32 (RISC-V CPU, ~14K cells), uart_tx (UART transmitter, ~100 cells), alu_8bit (8-bit ALU, ~255 cells). Returns immediately with a job directory. Use get-job-status to poll for results.",
     schema: z.object({
       design: z.enum(["picorv32", "uart_tx", "alu_8bit"]).describe("Which demo design to run"),
       freq_mhz: z.number().default(100).describe("Target clock frequency in MHz"),
       pdk: z.enum(["sky130", "gf180mcu", "asap7"]).default("sky130").describe("Process design kit"),
     }),
-    widget: {
-      name: "chip-design-result",
-      invoking: "Running demo design...",
-      invoked: "Demo design complete",
-    },
   },
   async ({ design, freq_mhz, pdk }) => {
     const paths: Record<string, [string, string]> = {
@@ -254,27 +316,15 @@ server.tool(
     };
     const [path, top] = paths[design];
     const jobDir = `/tmp/mcp_demo_${design}_${Date.now()}`;
-    const output = await runOnEC2(
-      `./target/release/zyphar flow -i ${path} --top ${top} --pdk ${pdk} --freq ${freq_mhz} --gds --output ${jobDir}/output 2>&1`,
-      600000
-    );
-    const stats = parseDesignStats(output);
-    const hasGds = await runOnEC2(`find ${jobDir}/output -name "*.gds" 2>/dev/null | head -1`).then(r => r.trim().length > 0).catch(() => false);
-    const pdkLabel: Record<string, string> = { sky130: "Sky130 130nm", gf180mcu: "GF180MCU 180nm", asap7: "ASAP7 7nm" };
-    return widget({
-      props: {
-        designName: `${top} (demo)`,
-        pdk: pdkLabel[pdk] || pdk,
-        cells: stats.cells || stats.instances || "N/A",
-        area: stats.area || "N/A",
-        wns: stats.wns || "N/A",
-        duration: stats.duration || "N/A",
-        hasGds: hasGds,
-        jobDir: jobDir,
-        filename: top,
-      },
-      output: text(output),
+    const flowCmd = `./target/release/zyphar flow -i ${path} --top ${top} --pdk ${pdk} --freq ${freq_mhz} --gds --output ${jobDir}/output`;
+    const { jobDir: jd } = await startBackgroundJob(jobDir, flowCmd, {
+      designName: `${top} (demo)`, pdk, freq: String(freq_mhz), tool: "run-demo-design",
     });
+    return text(
+      `Demo job started. Design: ${top}, PDK: ${pdk}, Freq: ${freq_mhz} MHz\n` +
+      `Job directory: ${jd}\n\n` +
+      `Use get-job-status with job_dir="${jd}" to check progress and get results.`
+    );
   }
 );
 
@@ -336,7 +386,7 @@ server.tool(
 server.tool(
   {
     name: "design-chip-signoff",
-    description: "Run full RTL-to-GDSII flow WITH signoff verification (DRC + LVS). Takes longer but produces manufacturing-ready output with DRC clean and LVS verified results. Returns an interactive card with downloadable GDSII file.",
+    description: "Start full RTL-to-GDSII flow WITH signoff verification (DRC + LVS) as a background job. Returns immediately with a job directory. Use get-job-status to poll for results.",
     schema: z.object({
       verilog: z.string().describe("Complete Verilog source code for the design"),
       top_module: z.string().optional().describe("Top-level module name. Auto-detected from Verilog if omitted."),
@@ -344,36 +394,77 @@ server.tool(
       freq_mhz: z.number().default(100).describe("Target clock frequency in MHz"),
       clock_port: z.string().default("clk").describe("Name of the clock port"),
     }),
-    widget: {
-      name: "chip-design-result",
-      invoking: "Designing chip with signoff...",
-      invoked: "Chip design with signoff complete",
-    },
   },
   async ({ verilog, top_module, pdk, freq_mhz, clock_port }) => {
     const top = top_module || extractTopModule(verilog);
     const inputPath = await uploadFile("input.v", verilog);
     const jobDir = inputPath.replace("/input.v", "");
-    const output = await runOnEC2(
-      `./target/release/zyphar flow -i ${inputPath} --top ${top} --pdk ${pdk} --freq ${freq_mhz} --clock ${clock_port} --no-pdn --util 0.45 --output ${jobDir}/output --signoff --gds --detailed-route 2>&1`,
-      600000
+    const flowCmd = `./target/release/zyphar flow -i ${inputPath} --top ${top} --pdk ${pdk} --freq ${freq_mhz} --clock ${clock_port} --no-pdn --util 0.45 --output ${jobDir}/output --signoff --gds --detailed-route`;
+    const { jobDir: jd } = await startBackgroundJob(jobDir, flowCmd, {
+      designName: top, pdk, freq: String(freq_mhz), tool: "design-chip-signoff",
+    });
+    return text(
+      `Signoff job started. Design: ${top}, PDK: ${pdk}, Freq: ${freq_mhz} MHz\n` +
+      `Job directory: ${jd}\n\n` +
+      `Use get-job-status with job_dir="${jd}" to check progress and get results.`
     );
-    const stats = parseDesignStats(output);
-    const hasGds = await runOnEC2(`find ${jobDir}/output -name "*.gds" 2>/dev/null | head -1`).then(r => r.trim().length > 0).catch(() => false);
+  }
+);
+
+server.tool(
+  {
+    name: "get-job-status",
+    description: "Check the status of a running chip design job. Returns results when complete, elapsed time when still running, or error details if failed. Use this after design-chip, design-chip-signoff, or run-demo-design to poll for completion.",
+    schema: z.object({
+      job_dir: z.string().describe("The job directory returned by design-chip, design-chip-signoff, or run-demo-design"),
+    }),
+    widget: {
+      name: "chip-design-result",
+      invoking: "Checking job status...",
+      invoked: "Job status retrieved",
+    },
+  },
+  async ({ job_dir }) => {
+    const status = await checkJobStatus(job_dir);
+
+    if (status.state === "running") {
+      return text(
+        `Job is still running. Elapsed: ${status.elapsedSeconds}s\n` +
+        `Job directory: ${job_dir}\n\n` +
+        `Call get-job-status again to check progress.`
+      );
+    }
+
+    if (status.state === "failed") {
+      return text(`Job FAILED after ${status.elapsedSeconds}s.\n\n${status.output || "No output available."}`);
+    }
+
+    // Completed -- read metadata for display
+    let designName = "unknown";
+    let pdkStr = "unknown";
+    try {
+      const metaRaw = await runOnEC2(`cat ${job_dir}/meta.json 2>/dev/null || echo '{}'`, 10000);
+      const meta = JSON.parse(metaRaw.trim());
+      designName = meta.designName || "unknown";
+      pdkStr = meta.pdk || "unknown";
+    } catch { /* ignore */ }
+
     const pdkLabel: Record<string, string> = { sky130: "Sky130 130nm", gf180mcu: "GF180MCU 180nm", asap7: "ASAP7 7nm" };
+    const stats = status.stats || {};
+
     return widget({
       props: {
-        designName: top,
-        pdk: pdkLabel[pdk] || pdk,
+        designName,
+        pdk: pdkLabel[pdkStr] || pdkStr,
         cells: stats.cells || stats.instances || "N/A",
         area: stats.area || "N/A",
         wns: stats.wns || "N/A",
-        duration: stats.duration || "N/A",
-        hasGds: hasGds,
-        jobDir: jobDir,
-        filename: top,
+        duration: stats.duration || `${status.elapsedSeconds}s`,
+        hasGds: status.hasGds || false,
+        jobDir: job_dir,
+        filename: designName.replace(/ \(demo\)$/, ""),
       },
-      output: text(output),
+      output: text(status.output || "Completed"),
     });
   }
 );
@@ -543,12 +634,19 @@ TESTBENCH RULES:
 AVAILABLE TOOLS:
 - simulate: Run Verilog simulation with testbench (iverilog). Proves the design WORKS. ~1 second.
 - fpga-synthesize: Synthesize for FPGA (iCE40/ECP5/Xilinx). Proves it runs on FPGA hardware. ~2 seconds.
-- design-chip: Full ASIC RTL-to-GDSII (Yosys + OpenROAD). Produces physical chip layout. ~2-15 seconds.
+- design-chip: Start ASIC RTL-to-GDSII (Yosys + OpenROAD) as background job. Returns job_dir immediately.
+- get-job-status: Poll a background job for completion. Returns results widget when done, elapsed time when running.
 - synthesize: ASIC synthesis only (faster, no layout).
 - estimate-ppa: Instant PPA estimate from cell count.
-- run-demo-design: Run a known-good design (picorv32, uart_tx, alu_8bit).
-- design-chip-signoff: Full flow + DRC + LVS verification for manufacturing readiness.
-- view-chip-3d: Interactive 3D visualization of the chip layout. Call AFTER design-chip. Pass the job directory path.
+- run-demo-design: Start a known-good design (picorv32, uart_tx, alu_8bit) as background job.
+- design-chip-signoff: Start full flow + DRC + LVS as background job.
+- view-chip-3d: Interactive 3D visualization of the chip layout. Call AFTER get-job-status shows completion.
+
+ASYNC WORKFLOW for design-chip, run-demo-design, design-chip-signoff:
+1. Call the tool -- it returns instantly with a job_dir
+2. Wait ~5 seconds, then call get-job-status with that job_dir
+3. If still running, wait longer and poll again
+4. When complete, get-job-status returns the full results widget with cell count, area, timing, and GDS download
 
 The user wants to design: ${description || "a chip (ask them what kind)"}`,
           },
