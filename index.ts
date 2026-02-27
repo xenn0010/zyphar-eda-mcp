@@ -315,7 +315,7 @@ server.tool(
     const top = top_module || extractTopModule(verilog);
     const inputPath = await uploadFile("input.v", verilog);
     const jobDir = inputPath.replace("/input.v", "");
-    const flowCmd = `./target/release/zyphar flow -i ${inputPath} --top ${top} --pdk ${pdk} --freq ${freq_mhz} --clock ${clock_port} --no-pdn --util 0.45 --gds --output ${jobDir}/output`;
+    const flowCmd = `./target/release/zyphar flow -i ${inputPath} --top ${top} --pdk ${pdk} --freq ${freq_mhz} --clock ${clock_port} --util 0.50 --gds --detailed-route --output ${jobDir}/output`;
     const { jobDir: jd } = await startBackgroundJob(jobDir, flowCmd, {
       designName: top, pdk, freq: String(freq_mhz), tool: "design-chip",
     });
@@ -345,7 +345,7 @@ server.tool(
     };
     const [path, top] = paths[design];
     const jobDir = `/tmp/mcp_demo_${design}_${Date.now()}`;
-    const flowCmd = `./target/release/zyphar flow -i ${path} --top ${top} --pdk ${pdk} --freq ${freq_mhz} --gds --output ${jobDir}/output`;
+    const flowCmd = `./target/release/zyphar flow -i ${path} --top ${top} --pdk ${pdk} --freq ${freq_mhz} --gds --detailed-route --output ${jobDir}/output`;
     const { jobDir: jd } = await startBackgroundJob(jobDir, flowCmd, {
       designName: `${top} (demo)`, pdk, freq: String(freq_mhz), tool: "run-demo-design",
     });
@@ -372,7 +372,7 @@ server.tool(
     const inputPath = await uploadFile("input.v", verilog);
     const jobDir = inputPath.replace("/input.v", "");
     const output = await runOnEC2(
-      `./target/release/zyphar flow -i ${inputPath} --top ${top} --pdk ${pdk} --skip-pnr --no-pdn --output ${jobDir}/output 2>&1`
+      `./target/release/zyphar flow -i ${inputPath} --top ${top} --pdk ${pdk} --skip-pnr --output ${jobDir}/output 2>&1`
     );
     return text(output);
   }
@@ -429,7 +429,7 @@ server.tool(
     const top = top_module || extractTopModule(verilog);
     const inputPath = await uploadFile("input.v", verilog);
     const jobDir = inputPath.replace("/input.v", "");
-    const flowCmd = `./target/release/zyphar flow -i ${inputPath} --top ${top} --pdk ${pdk} --freq ${freq_mhz} --clock ${clock_port} --no-pdn --util 0.45 --output ${jobDir}/output --signoff --gds --detailed-route`;
+    const flowCmd = `./target/release/zyphar flow -i ${inputPath} --top ${top} --pdk ${pdk} --freq ${freq_mhz} --clock ${clock_port} --util 0.50 --output ${jobDir}/output --signoff --gds --detailed-route`;
     const { jobDir: jd } = await startBackgroundJob(jobDir, flowCmd, {
       designName: top, pdk, freq: String(freq_mhz), tool: "design-chip-signoff",
     });
@@ -944,7 +944,7 @@ server.tool(
     const top = top_module || extractTopModule(netlist);
     const inputPath = await uploadFile("netlist.v", netlist);
     const jobDir = inputPath.replace("/netlist.v", "");
-    const flowCmd = `./target/release/zyphar flow -i ${inputPath} --top ${top} --pdk ${pdk} --freq ${freq_mhz} --clock ${clock_port} --skip-synth --no-pdn --util ${utilization} --gds --output ${jobDir}/output`;
+    const flowCmd = `./target/release/zyphar flow -i ${inputPath} --top ${top} --pdk ${pdk} --freq ${freq_mhz} --clock ${clock_port} --skip-synth --util ${utilization} --gds --detailed-route --output ${jobDir}/output`;
     const { jobDir: jd } = await startBackgroundJob(jobDir, flowCmd, {
       designName: top, pdk, freq: String(freq_mhz), tool: "place-and-route",
     });
@@ -1160,7 +1160,7 @@ server.tool(
     for (const pdk of pdks) {
       for (const freq of frequencies) {
         const variantDir = `${sweepDir}/${pdk}_${freq}mhz`;
-        const flowCmd = `./target/release/zyphar flow -i ${inputPath} --top ${top} --pdk ${pdk} --freq ${freq} --clock ${clock_port} --no-pdn --util 0.45 --gds --output ${variantDir}/output`;
+        const flowCmd = `./target/release/zyphar flow -i ${inputPath} --top ${top} --pdk ${pdk} --freq ${freq} --clock ${clock_port} --util 0.50 --gds --detailed-route --output ${variantDir}/output`;
         const { jobDir: jd } = await startBackgroundJob(variantDir, flowCmd, {
           designName: `${top} (${pdk}@${freq}MHz)`, pdk, freq: String(freq), tool: "design-sweep",
         });
