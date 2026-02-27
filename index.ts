@@ -4,7 +4,7 @@ import { Client } from "ssh2";
 import { readFileSync } from "fs";
 
 const EC2_HOST = "ec2-18-219-59-121.us-east-2.compute.amazonaws.com";
-const ZYPHAR_ENV = "export PATH=$HOME/.cargo/bin:$PATH && export ORFS_PATH=/tmp/OpenROAD-flow-scripts && cd ~/Zyphar-new";
+const ZYPHAR_ENV = "export PATH=$HOME/.cargo/bin:$PATH && export ORFS_PATH=/tmp/OpenROAD-flow-scripts && export IHP_PDK_PATH=/tmp/IHP-Open-PDK && cd ~/Zyphar-new";
 
 function getSSHKey(): string {
   if (process.env.SSH_PRIVATE_KEY_B64) {
@@ -266,7 +266,7 @@ const server = new MCPServer({
   name: "zyphar-eda",
   title: "Zyphar EDA - Chip Design from Chat",
   version: "1.0.0",
-  description: "Design chips from chat. Full RTL-to-GDSII: synthesis, place & route, timing, DRC, LVS. Supports Sky130, GF180MCU, ASAP7 PDKs.",
+  description: "Design chips from chat. Full RTL-to-GDSII: synthesis, place & route, timing, DRC, LVS. Supports Sky130, GF180MCU, ASAP7, IHP SG13G2 PDKs.",
   baseUrl: process.env.MCP_URL || "http://localhost:3000",
 });
 
@@ -277,7 +277,7 @@ server.tool(
     schema: z.object({
       verilog: z.string().describe("Complete Verilog source code for the design"),
       top_module: z.string().optional().describe("Top-level module name. Auto-detected from Verilog if omitted."),
-      pdk: z.enum(["sky130", "gf180mcu", "asap7"]).default("sky130").describe("Process design kit: sky130 (130nm), gf180mcu (180nm), asap7 (7nm predictive)"),
+      pdk: z.enum(["sky130", "gf180mcu", "asap7", "ihp130"]).default("sky130").describe("Process design kit: sky130 (130nm), gf180mcu (180nm), asap7 (7nm predictive), ihp130 (IHP SG13G2 130nm)"),
       freq_mhz: z.number().default(100).describe("Target clock frequency in MHz"),
       clock_port: z.string().default("clk").describe("Name of the clock port in the design"),
     }),
@@ -305,7 +305,7 @@ server.tool(
     schema: z.object({
       design: z.enum(["picorv32", "uart_tx", "alu_8bit"]).describe("Which demo design to run"),
       freq_mhz: z.number().default(100).describe("Target clock frequency in MHz"),
-      pdk: z.enum(["sky130", "gf180mcu", "asap7"]).default("sky130").describe("Process design kit"),
+      pdk: z.enum(["sky130", "gf180mcu", "asap7", "ihp130"]).default("sky130").describe("Process design kit"),
     }),
   },
   async ({ design, freq_mhz, pdk }) => {
@@ -335,7 +335,7 @@ server.tool(
     schema: z.object({
       verilog: z.string().describe("Complete Verilog source code"),
       top_module: z.string().optional().describe("Top-level module name. Auto-detected from Verilog if omitted."),
-      pdk: z.enum(["sky130", "gf180mcu", "asap7"]).default("sky130"),
+      pdk: z.enum(["sky130", "gf180mcu", "asap7", "ihp130"]).default("sky130"),
     }),
   },
   async ({ verilog, top_module, pdk }) => {
@@ -355,7 +355,7 @@ server.tool(
     description: "Quick power-performance-area estimate from cell count. No EDA tools needed -- returns instantly. Useful for early design exploration before running the full flow.",
     schema: z.object({
       cells: z.number().describe("Estimated number of standard cells"),
-      pdk: z.enum(["sky130", "gf180mcu", "asap7"]).default("sky130"),
+      pdk: z.enum(["sky130", "gf180mcu", "asap7", "ihp130"]).default("sky130"),
       freq_mhz: z.number().default(100).describe("Target clock frequency in MHz"),
     }),
   },
@@ -364,6 +364,7 @@ server.tool(
       sky130: [2.0, 0.01, 0.1],
       gf180mcu: [1.6, 0.008, 0.085],
       asap7: [0.5, 0.003, 0.05],
+      ihp130: [1.8, 0.009, 0.09],
     };
     const [cellArea, powerPerCell, gateDelay] = params[pdk] || params.sky130;
     const area = cells * cellArea;
@@ -390,7 +391,7 @@ server.tool(
     schema: z.object({
       verilog: z.string().describe("Complete Verilog source code for the design"),
       top_module: z.string().optional().describe("Top-level module name. Auto-detected from Verilog if omitted."),
-      pdk: z.enum(["sky130", "gf180mcu", "asap7"]).default("sky130"),
+      pdk: z.enum(["sky130", "gf180mcu", "asap7", "ihp130"]).default("sky130"),
       freq_mhz: z.number().default(100).describe("Target clock frequency in MHz"),
       clock_port: z.string().default("clk").describe("Name of the clock port"),
     }),
@@ -449,7 +450,7 @@ server.tool(
       pdkStr = meta.pdk || "unknown";
     } catch { /* ignore */ }
 
-    const pdkLabel: Record<string, string> = { sky130: "Sky130 130nm", gf180mcu: "GF180MCU 180nm", asap7: "ASAP7 7nm" };
+    const pdkLabel: Record<string, string> = { sky130: "Sky130 130nm", gf180mcu: "GF180MCU 180nm", asap7: "ASAP7 7nm", ihp130: "IHP SG13G2 130nm" };
     const stats = status.stats || {};
 
     return widget({
@@ -591,6 +592,566 @@ server.tool(
   }
 );
 
+// ============================================================
+// Verification & Analysis Tools
+// ============================================================
+
+server.tool(
+  {
+    name: "analyze-timing",
+    description: "Run static timing analysis on a completed design. Returns worst negative slack (WNS), total negative slack (TNS), critical path details, and slack histogram. Requires a completed job from design-chip, or provide a netlist directly.",
+    schema: z.object({
+      job_dir: z.string().optional().describe("Job directory from a previous design-chip run. Reuses the PnR results for accurate post-route timing."),
+      netlist: z.string().optional().describe("Gate-level Verilog netlist (alternative to job_dir)"),
+      pdk: z.enum(["sky130", "gf180mcu", "asap7", "ihp130"]).default("sky130").describe("PDK (required if providing netlist directly)"),
+      freq_mhz: z.number().default(100).describe("Target clock frequency in MHz"),
+      clock_port: z.string().default("clk").describe("Clock port name"),
+    }),
+    widget: {
+      name: "timing-report",
+      invoking: "Analyzing timing...",
+      invoked: "Timing analysis complete",
+    },
+  },
+  async ({ job_dir, netlist, pdk, freq_mhz, clock_port }) => {
+    let netlistPath: string;
+    let jobDir: string;
+
+    if (job_dir) {
+      jobDir = job_dir;
+      // Find the netlist from the completed job
+      netlistPath = (await runOnEC2(
+        `find ${job_dir}/output -name "*.v" -o -name "*.vg" 2>/dev/null | head -1`,
+        10000
+      )).trim();
+      if (!netlistPath) {
+        return text(`No netlist found in ${job_dir}/output. Ensure design-chip completed successfully.`);
+      }
+    } else if (netlist) {
+      const uploaded = await uploadFile("netlist.v", netlist);
+      jobDir = uploaded.replace("/netlist.v", "");
+      netlistPath = uploaded;
+    } else {
+      return text("Provide either job_dir (from design-chip) or a netlist.");
+    }
+
+    const period = (1000 / freq_mhz).toFixed(3);
+    const output = await runOnEC2(
+      `./target/release/zyphar sta --netlist ${netlistPath} --pdk ${pdk} --clock-port ${clock_port} --clock-period ${period} 2>&1`,
+      60000
+    );
+
+    // Parse timing results
+    const wnsMatch = output.match(/WNS[:\s]+([-+]?\d+\.?\d*)/);
+    const tnsMatch = output.match(/TNS[:\s]+([-+]?\d+\.?\d*)/);
+    const pathLines = output.split("\n").filter(l => /slack|arrival|delay|endpoint/i.test(l));
+
+    const wns = wnsMatch ? wnsMatch[1] : "N/A";
+    const tns = tnsMatch ? tnsMatch[1] : "N/A";
+    const timingMet = wnsMatch ? parseFloat(wnsMatch[1]) >= 0 : false;
+
+    return widget({
+      props: {
+        wns,
+        tns,
+        freqMhz: freq_mhz,
+        clockPort: clock_port,
+        timingMet,
+        criticalPath: pathLines.slice(0, 20).join("\n"),
+        pdk,
+      },
+      output: text(output),
+    });
+  }
+);
+
+server.tool(
+  {
+    name: "check-drc",
+    description: "Run design rule checking (DRC) on a GDSII layout from a completed design job. Reports violations by type and layer. Requires a completed job with GDS output (use design-chip-signoff or design-chip with --gds).",
+    schema: z.object({
+      job_dir: z.string().describe("Job directory from a previous design-chip or design-chip-signoff run"),
+    }),
+    widget: {
+      name: "verification-report",
+      invoking: "Running DRC...",
+      invoked: "DRC complete",
+    },
+  },
+  async ({ job_dir }) => {
+    // Find GDS and determine top module
+    const gdsFile = (await runOnEC2(
+      `find ${job_dir}/output -name "*.gds" 2>/dev/null | head -1`,
+      10000
+    )).trim();
+    if (!gdsFile) {
+      return text(`No GDSII file found in ${job_dir}/output. Run design-chip with --gds first.`);
+    }
+
+    let top = "unknown";
+    try {
+      const metaRaw = await runOnEC2(`cat ${job_dir}/meta.json 2>/dev/null || echo '{}'`, 10000);
+      const meta = JSON.parse(metaRaw.trim());
+      top = (meta.designName || "unknown").replace(/ \(demo\)$/, "");
+    } catch { /* ignore */ }
+
+    let pdkStr = "sky130";
+    try {
+      const metaRaw = await runOnEC2(`cat ${job_dir}/meta.json 2>/dev/null || echo '{}'`, 10000);
+      const meta = JSON.parse(metaRaw.trim());
+      pdkStr = meta.pdk || "sky130";
+    } catch { /* ignore */ }
+
+    const output = await runOnEC2(
+      `./target/release/zyphar drc --gds ${gdsFile} --top ${top} --pdk ${pdkStr} 2>&1`,
+      120000
+    );
+
+    // Parse DRC results
+    const violationMatch = output.match(/(\d+)\s*(?:violation|error|issue)/i);
+    const violationCount = violationMatch ? parseInt(violationMatch[1]) : 0;
+    const clean = /DRC\s*(?:clean|CLEAN|passed|PASSED)|0\s*violation/i.test(output);
+
+    return widget({
+      props: {
+        checkType: "DRC",
+        passed: clean,
+        violationCount,
+        designName: top,
+        pdk: pdkStr,
+        details: output.slice(-2000),
+      },
+      output: text(output),
+    });
+  }
+);
+
+server.tool(
+  {
+    name: "check-lvs",
+    description: "Run layout vs. schematic (LVS) checking on a completed design. Compares the physical layout (GDS) against the logical netlist to verify they match. Requires a completed job with GDS output.",
+    schema: z.object({
+      job_dir: z.string().describe("Job directory from a previous design-chip or design-chip-signoff run"),
+    }),
+    widget: {
+      name: "verification-report",
+      invoking: "Running LVS...",
+      invoked: "LVS complete",
+    },
+  },
+  async ({ job_dir }) => {
+    const gdsFile = (await runOnEC2(
+      `find ${job_dir}/output -name "*.gds" 2>/dev/null | head -1`,
+      10000
+    )).trim();
+    if (!gdsFile) {
+      return text(`No GDSII file found in ${job_dir}/output. Run design-chip with --gds first.`);
+    }
+
+    const netlistFile = (await runOnEC2(
+      `find ${job_dir}/output -name "*.v" -o -name "*.vg" 2>/dev/null | head -1`,
+      10000
+    )).trim();
+
+    let top = "unknown";
+    let pdkStr = "sky130";
+    try {
+      const metaRaw = await runOnEC2(`cat ${job_dir}/meta.json 2>/dev/null || echo '{}'`, 10000);
+      const meta = JSON.parse(metaRaw.trim());
+      top = (meta.designName || "unknown").replace(/ \(demo\)$/, "");
+      pdkStr = meta.pdk || "sky130";
+    } catch { /* ignore */ }
+
+    const output = await runOnEC2(
+      `./target/release/zyphar lvs --gds ${gdsFile} --netlist ${netlistFile} --top ${top} --pdk ${pdkStr} 2>&1`,
+      120000
+    );
+
+    const match = /(\d+)\/(\d+)\s*circuits?\s*match/i.test(output) || /LVS\s*(clean|CLEAN|passed|match)/i.test(output);
+    const matchInfo = output.match(/(\d+)\/(\d+)\s*circuits?\s*match/i);
+    const matchCount = matchInfo ? `${matchInfo[1]}/${matchInfo[2]}` : "N/A";
+
+    return widget({
+      props: {
+        checkType: "LVS",
+        passed: match,
+        violationCount: match ? 0 : 1,
+        designName: top,
+        pdk: pdkStr,
+        matchCount,
+        details: output.slice(-2000),
+      },
+      output: text(output),
+    });
+  }
+);
+
+server.tool(
+  {
+    name: "analyze-power",
+    description: "Estimate power consumption of a completed design. Reports total, leakage, and dynamic power breakdown. Requires a completed PnR job or a gate-level netlist.",
+    schema: z.object({
+      job_dir: z.string().optional().describe("Job directory from a previous design-chip run"),
+      netlist: z.string().optional().describe("Gate-level Verilog netlist (alternative to job_dir)"),
+      pdk: z.enum(["sky130", "gf180mcu", "asap7", "ihp130"]).default("sky130"),
+      freq_mhz: z.number().default(100).describe("Target clock frequency in MHz"),
+    }),
+  },
+  async ({ job_dir, netlist, pdk, freq_mhz }) => {
+    let defPath: string | null = null;
+    let netlistPath: string | null = null;
+
+    if (job_dir) {
+      defPath = (await runOnEC2(
+        `find ${job_dir}/output -name "*.def" 2>/dev/null | head -1`,
+        10000
+      )).trim() || null;
+      netlistPath = (await runOnEC2(
+        `find ${job_dir}/output -name "*.v" -o -name "*.vg" 2>/dev/null | head -1`,
+        10000
+      )).trim() || null;
+    } else if (netlist) {
+      const uploaded = await uploadFile("netlist.v", netlist);
+      netlistPath = uploaded;
+    } else {
+      return text("Provide either job_dir (from design-chip) or a netlist.");
+    }
+
+    const target = defPath || netlistPath;
+    if (!target) {
+      return text("No DEF or netlist found. Ensure the design job completed successfully.");
+    }
+
+    const period = (1000 / freq_mhz).toFixed(3);
+    const inputFlag = defPath ? `--def ${defPath}` : `--netlist ${netlistPath}`;
+    const output = await runOnEC2(
+      `./target/release/zyphar power ${inputFlag} --pdk ${pdk} --clock-period ${period} 2>&1`,
+      30000
+    );
+
+    return text(output);
+  }
+);
+
+server.tool(
+  {
+    name: "analyze-cdc",
+    description: "Detect clock domain crossings (CDC) in a gate-level netlist. Identifies signals that cross between clock domains without proper synchronization. Optionally inserts synchronizers.",
+    schema: z.object({
+      netlist: z.string().describe("Gate-level Verilog netlist to analyze"),
+      fix: z.boolean().default(false).describe("If true, insert synchronizers and return the fixed netlist"),
+    }),
+  },
+  async ({ netlist, fix }) => {
+    const uploaded = await uploadFile("cdc_input.v", netlist);
+    const jobDir = uploaded.replace("/cdc_input.v", "");
+    const fixFlag = fix ? `--fix --output ${jobDir}/cdc_fixed.v` : "";
+    const output = await runOnEC2(
+      `./target/release/zyphar cdc --netlist ${uploaded} ${fixFlag} 2>&1`,
+      30000
+    );
+
+    if (fix) {
+      try {
+        const fixed = await runOnEC2(`cat ${jobDir}/cdc_fixed.v 2>/dev/null`, 10000);
+        if (fixed.trim().length > 0) {
+          return text(`${output}\n\n--- Fixed Netlist ---\n${fixed}`);
+        }
+      } catch { /* no fixed file */ }
+    }
+
+    return text(output);
+  }
+);
+
+server.tool(
+  {
+    name: "verify-equivalence",
+    description: "Formally verify that a gate-level netlist is logically equivalent to the original RTL. Uses Yosys equivalence checking (SAT-based). Proves synthesis did not introduce bugs.",
+    schema: z.object({
+      rtl: z.string().describe("Original RTL Verilog source code"),
+      netlist: z.string().describe("Gate-level netlist to verify against RTL"),
+      top_module: z.string().describe("Top-level module name"),
+    }),
+  },
+  async ({ rtl, netlist, top_module }) => {
+    const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    const jobDir = `/tmp/mcp_fec/${jobId}`;
+    await runOnEC2(`mkdir -p ${jobDir}`);
+    await uploadFile("rtl.v", rtl, jobDir);
+    await uploadFile("netlist.v", netlist, jobDir);
+
+    const output = await runOnEC2(
+      `./target/release/zyphar formal equiv --reference ${jobDir}/rtl.v --implementation ${jobDir}/netlist.v --top ${top_module} 2>&1`,
+      60000
+    );
+
+    const passed = /PASS|equivalent|proven/i.test(output);
+    const failed = /FAIL|mismatch|not equivalent/i.test(output);
+    const status = passed ? "PASS -- Design is formally equivalent" : failed ? "FAIL -- Mismatches detected" : "INCONCLUSIVE";
+
+    return text(`Formal Equivalence Check: ${status}\n\n${output}`);
+  }
+);
+
+// ============================================================
+// Design Flow Tools
+// ============================================================
+
+server.tool(
+  {
+    name: "place-and-route",
+    description: "Run standalone place & route on an existing gate-level netlist. Use this when you already have a synthesized netlist and want to generate a physical layout. Launches as a background job.",
+    schema: z.object({
+      netlist: z.string().describe("Gate-level Verilog netlist"),
+      top_module: z.string().optional().describe("Top-level module name. Auto-detected if omitted."),
+      pdk: z.enum(["sky130", "gf180mcu", "asap7", "ihp130"]).default("sky130"),
+      freq_mhz: z.number().default(100).describe("Target clock frequency in MHz"),
+      clock_port: z.string().default("clk").describe("Clock port name"),
+      utilization: z.number().default(0.45).describe("Target utilization (0.0 to 1.0)"),
+    }),
+  },
+  async ({ netlist, top_module, pdk, freq_mhz, clock_port, utilization }) => {
+    const top = top_module || extractTopModule(netlist);
+    const inputPath = await uploadFile("netlist.v", netlist);
+    const jobDir = inputPath.replace("/netlist.v", "");
+    const flowCmd = `./target/release/zyphar flow -i ${inputPath} --top ${top} --pdk ${pdk} --freq ${freq_mhz} --clock ${clock_port} --skip-synth --no-pdn --util ${utilization} --gds --output ${jobDir}/output`;
+    const { jobDir: jd } = await startBackgroundJob(jobDir, flowCmd, {
+      designName: top, pdk, freq: String(freq_mhz), tool: "place-and-route",
+    });
+    return text(
+      `PnR job started. Design: ${top}, PDK: ${pdk}, Freq: ${freq_mhz} MHz, Util: ${utilization}\n` +
+      `Job directory: ${jd}\n\n` +
+      `Use get-job-status with job_dir="${jd}" to check progress.`
+    );
+  }
+);
+
+server.tool(
+  {
+    name: "compile-memory",
+    description: "Generate an SRAM macro using OpenRAM. Produces LEF, GDS, Liberty, and Verilog models for the specified memory configuration. Currently supports Sky130 PDK.",
+    schema: z.object({
+      words: z.number().describe("Number of words (rows) in the SRAM"),
+      bits: z.number().describe("Number of bits per word (columns)"),
+      pdk: z.enum(["sky130"]).default("sky130").describe("PDK for memory compilation (Sky130 only)"),
+    }),
+  },
+  async ({ words, bits, pdk }) => {
+    const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    const jobDir = `/tmp/mcp_sram/${jobId}`;
+    const output = await runOnEC2(
+      `mkdir -p ${jobDir} && ./target/release/zyphar memory --words ${words} --bits ${bits} --pdk ${pdk} --output-dir ${jobDir} 2>&1`,
+      60000
+    );
+    return text(output);
+  }
+);
+
+server.tool(
+  {
+    name: "assemble-chip",
+    description: "Assemble a chip with I/O pad ring and power distribution network around an existing placed-and-routed design. Launches as a background job.",
+    schema: z.object({
+      job_dir: z.string().describe("Job directory from a completed place-and-route or design-chip job"),
+      die_size: z.string().default("2000x2000").describe("Die size in microns, format: WIDTHxHEIGHT"),
+      power_pads: z.number().default(4).describe("Number of VDD power pads"),
+      ground_pads: z.number().default(4).describe("Number of VSS ground pads"),
+    }),
+  },
+  async ({ job_dir, die_size, power_pads, ground_pads }) => {
+    const defFile = (await runOnEC2(
+      `find ${job_dir}/output -name "*.def" 2>/dev/null | head -1`,
+      10000
+    )).trim();
+    if (!defFile) {
+      return text(`No DEF file found in ${job_dir}/output. Run design-chip or place-and-route first.`);
+    }
+
+    let pdkStr = "sky130";
+    try {
+      const metaRaw = await runOnEC2(`cat ${job_dir}/meta.json 2>/dev/null || echo '{}'`, 10000);
+      const meta = JSON.parse(metaRaw.trim());
+      pdkStr = meta.pdk || "sky130";
+    } catch { /* ignore */ }
+
+    const chipDir = `/tmp/mcp_chip_${Date.now().toString(36)}`;
+    const chipCmd = `./target/release/zyphar chip --def ${defFile} --die-size ${die_size} --pdk ${pdkStr} --power-pads ${power_pads} --ground-pads ${ground_pads} --output ${chipDir}/output`;
+    const { jobDir: jd } = await startBackgroundJob(chipDir, chipCmd, {
+      designName: `chip-assembly`, pdk: pdkStr, tool: "assemble-chip",
+    });
+    return text(
+      `Chip assembly job started. Die: ${die_size} um, Pads: ${power_pads} VDD + ${ground_pads} VSS\n` +
+      `Job directory: ${jd}\n\n` +
+      `Use get-job-status with job_dir="${jd}" to check progress.`
+    );
+  }
+);
+
+server.tool(
+  {
+    name: "wrap-caravel",
+    description: "Wrap a completed design into a Caravel SoC harness for Google/Efabless tapeout on Sky130. Produces a submission-ready package. Launches as a background job.",
+    schema: z.object({
+      job_dir: z.string().describe("Job directory from a completed design-chip or design-chip-signoff run"),
+      variant: z.enum(["caravel", "caravan", "user-project-wrapper"]).default("user-project-wrapper").describe("Caravel integration variant"),
+    }),
+  },
+  async ({ job_dir, variant }) => {
+    const gdsFile = (await runOnEC2(
+      `find ${job_dir}/output -name "*.gds" 2>/dev/null | head -1`,
+      10000
+    )).trim();
+    if (!gdsFile) {
+      return text(`No GDSII file found in ${job_dir}/output. Run design-chip with --gds first.`);
+    }
+    const netlistFile = (await runOnEC2(
+      `find ${job_dir}/output -name "*.v" -o -name "*.vg" 2>/dev/null | head -1`,
+      10000
+    )).trim();
+
+    let top = "unknown";
+    try {
+      const metaRaw = await runOnEC2(`cat ${job_dir}/meta.json 2>/dev/null || echo '{}'`, 10000);
+      const meta = JSON.parse(metaRaw.trim());
+      top = (meta.designName || "unknown").replace(/ \(demo\)$/, "");
+    } catch { /* ignore */ }
+
+    const caravelDir = `/tmp/mcp_caravel_${Date.now().toString(36)}`;
+    const caravelCmd = `./target/release/zyphar caravel --user-macro ${gdsFile} --netlist ${netlistFile} --top ${top} --variant ${variant} --output ${caravelDir}/output`;
+    const { jobDir: jd } = await startBackgroundJob(caravelDir, caravelCmd, {
+      designName: `${top}-caravel`, pdk: "sky130", tool: "wrap-caravel",
+    });
+    return text(
+      `Caravel wrap job started. Design: ${top}, Variant: ${variant}\n` +
+      `Job directory: ${jd}\n\n` +
+      `Use get-job-status with job_dir="${jd}" to check progress.`
+    );
+  }
+);
+
+// ============================================================
+// Utility Tools
+// ============================================================
+
+server.tool(
+  {
+    name: "lint-verilog",
+    description: "Run Verilator lint checks on Verilog source code before synthesis. Catches common coding errors, undriven signals, width mismatches, and style issues. Fast pre-synthesis validation.",
+    schema: z.object({
+      verilog: z.string().describe("Verilog source code to lint"),
+      top_module: z.string().optional().describe("Top-level module name. Auto-detected if omitted."),
+    }),
+  },
+  async ({ verilog, top_module }) => {
+    const top = top_module || extractTopModule(verilog);
+    const jobId = Date.now().toString(36);
+    const jobDir = `/tmp/mcp_lint/${jobId}`;
+    await runOnEC2(`mkdir -p ${jobDir}`);
+    await uploadFile("design.v", verilog, jobDir);
+
+    const output = await runOnEC2(
+      `verilator --lint-only -Wall --top-module ${top} ${jobDir}/design.v 2>&1`,
+      15000
+    );
+
+    const warnings = output.split("\n").filter(l => /Warning|Error/i.test(l));
+    const errorCount = warnings.filter(l => /Error/i.test(l)).length;
+    const warnCount = warnings.filter(l => /Warning/i.test(l)).length;
+
+    const summary = errorCount > 0
+      ? `Lint FAILED: ${errorCount} error(s), ${warnCount} warning(s)`
+      : warnCount > 0
+      ? `Lint passed with ${warnCount} warning(s)`
+      : "Lint CLEAN -- no issues found";
+
+    return text(`${summary}\n\n${output.trim()}`);
+  }
+);
+
+server.tool(
+  {
+    name: "netlist-stats",
+    description: "Analyze a gate-level netlist or Verilog design and report statistics: cell types, hierarchy, fanout distribution, area by module. Uses Yosys stat command.",
+    schema: z.object({
+      job_dir: z.string().optional().describe("Job directory from a previous design-chip run (uses synthesized netlist)"),
+      verilog: z.string().optional().describe("Verilog source or netlist to analyze (alternative to job_dir)"),
+      pdk: z.enum(["sky130", "gf180mcu", "asap7", "ihp130"]).default("sky130"),
+    }),
+  },
+  async ({ job_dir, verilog, pdk }) => {
+    let inputPath: string;
+
+    if (job_dir) {
+      inputPath = (await runOnEC2(
+        `find ${job_dir}/output -name "*.v" -o -name "*.vg" 2>/dev/null | head -1`,
+        10000
+      )).trim();
+      if (!inputPath) {
+        return text(`No netlist found in ${job_dir}/output.`);
+      }
+    } else if (verilog) {
+      inputPath = await uploadFile("stats_input.v", verilog);
+    } else {
+      return text("Provide either job_dir or verilog source.");
+    }
+
+    const output = await runOnEC2(
+      `yosys -p "read_verilog ${inputPath}; hierarchy -auto-top; stat" 2>&1`,
+      15000
+    );
+
+    // Extract stat section
+    const statIdx = output.indexOf("Printing statistics.");
+    const stats = statIdx >= 0 ? output.slice(statIdx) : output.slice(-1000);
+    return text(`Netlist Statistics\n${stats.trim()}`);
+  }
+);
+
+server.tool(
+  {
+    name: "design-sweep",
+    description: "Run multi-variant design exploration by sweeping across frequencies and/or PDKs. Launches parallel synthesis+PnR jobs and returns a comparison table. Use get-job-status to poll each variant.",
+    schema: z.object({
+      verilog: z.string().describe("Complete Verilog source code"),
+      top_module: z.string().optional().describe("Top-level module name"),
+      frequencies: z.array(z.number()).default([100]).describe("List of target frequencies in MHz to sweep"),
+      pdks: z.array(z.enum(["sky130", "gf180mcu", "asap7", "ihp130"])).default(["sky130"]).describe("List of PDKs to sweep"),
+      clock_port: z.string().default("clk").describe("Clock port name"),
+    }),
+  },
+  async ({ verilog, top_module, frequencies, pdks, clock_port }) => {
+    const top = top_module || extractTopModule(verilog);
+    const sweepId = Date.now().toString(36);
+    const sweepDir = `/tmp/mcp_sweep/${sweepId}`;
+    const inputPath = await uploadFile("input.v", verilog, sweepDir);
+
+    const jobs: { pdk: string; freq: number; jobDir: string }[] = [];
+
+    for (const pdk of pdks) {
+      for (const freq of frequencies) {
+        const variantDir = `${sweepDir}/${pdk}_${freq}mhz`;
+        const flowCmd = `./target/release/zyphar flow -i ${inputPath} --top ${top} --pdk ${pdk} --freq ${freq} --clock ${clock_port} --no-pdn --util 0.45 --gds --output ${variantDir}/output`;
+        const { jobDir: jd } = await startBackgroundJob(variantDir, flowCmd, {
+          designName: `${top} (${pdk}@${freq}MHz)`, pdk, freq: String(freq), tool: "design-sweep",
+        });
+        jobs.push({ pdk, freq, jobDir: jd });
+      }
+    }
+
+    const jobList = jobs.map(j => `  ${j.pdk} @ ${j.freq} MHz -> ${j.jobDir}`).join("\n");
+    return text(
+      `Design sweep started: ${jobs.length} variant(s) for ${top}\n\n` +
+      `Variants:\n${jobList}\n\n` +
+      `Use get-job-status with each job_dir to check progress and collect results.`
+    );
+  }
+);
+
+// ============================================================
+// Prompts
+// ============================================================
+
 server.prompt(
   {
     name: "design-a-chip",
@@ -681,13 +1242,189 @@ Run this demo sequence:
 Key talking points:
 - This is REAL synthesis (Yosys) and place & route (OpenROAD), not simulation
 - The output is a physical chip layout (DEF file) that could be sent to a foundry
-- Supports 3 PDKs: Sky130 (130nm, Google/SkyWater), GF180MCU (180nm, GlobalFoundries), ASAP7 (7nm predictive)
+- Supports 4 PDKs: Sky130 (130nm, Google/SkyWater), GF180MCU (180nm, GlobalFoundries), ASAP7 (7nm predictive), IHP SG13G2 (130nm BiCMOS, IHP GmbH)
 - Designs from 10 cells to 50,000+ cells in seconds to minutes`,
           },
         },
       ],
     };
   }
+);
+
+server.prompt(
+  {
+    name: "verify-design",
+    description: "Guided signoff checklist for a completed chip design. Walks through simulation, synthesis, DRC, LVS, STA, and power analysis in order.",
+    schema: z.object({
+      job_dir: z.string().optional().describe("Job directory from a previous design-chip run"),
+      verilog: z.string().optional().describe("Original RTL source code for simulation and equivalence checking"),
+    }),
+  },
+  async ({ job_dir, verilog }) => {
+    return {
+      messages: [
+        {
+          role: "user" as const,
+          content: {
+            type: "text" as const,
+            text: `You are a chip verification engineer using Zyphar EDA tools.
+
+Run a complete signoff checklist for this design. Execute each step in order and report results:
+
+1. **Functional Verification** (if RTL provided): Call "simulate" with a self-checking testbench
+2. **Synthesis Check**: Call "netlist-stats" to verify cell counts and hierarchy
+3. **Static Timing Analysis**: Call "analyze-timing" to check WNS/TNS
+4. **DRC**: Call "check-drc" to verify design rules
+5. **LVS**: Call "check-lvs" to verify layout matches schematic
+6. **Power Analysis**: Call "analyze-power" to estimate power consumption
+7. **Formal Equivalence** (if RTL provided): Call "verify-equivalence" to prove correctness
+
+After each step, report PASS/FAIL with key metrics. At the end, provide a signoff summary table.
+
+${job_dir ? `Job directory: ${job_dir}` : "No job directory provided -- ask the user for one."}
+${verilog ? "RTL source code provided for functional and formal verification." : "No RTL provided -- skip simulation and formal equivalence steps."}`,
+          },
+        },
+      ],
+    };
+  }
+);
+
+server.prompt(
+  {
+    name: "optimize-timing",
+    description: "Interactive timing closure workflow. Iteratively synthesizes, analyzes timing, and suggests constraint adjustments until timing is met.",
+    schema: z.object({
+      verilog: z.string().describe("RTL Verilog source code to optimize"),
+      freq_mhz: z.number().default(100).describe("Target frequency in MHz"),
+      pdk: z.enum(["sky130", "gf180mcu", "asap7", "ihp130"]).default("sky130"),
+    }),
+  },
+  async ({ verilog, freq_mhz, pdk }) => {
+    return {
+      messages: [
+        {
+          role: "user" as const,
+          content: {
+            type: "text" as const,
+            text: `You are a timing closure engineer using Zyphar EDA tools.
+
+Goal: Achieve timing closure for this design at ${freq_mhz} MHz on ${pdk}.
+
+WORKFLOW:
+1. Call "synthesize" with the provided Verilog
+2. Call "analyze-timing" on the result
+3. If WNS is negative (timing violation):
+   a. Identify the critical path from the timing report
+   b. Suggest RTL modifications (pipeline stages, logic restructuring)
+   c. Try a lower frequency or different PDK if architecture changes are not enough
+   d. Re-synthesize and re-analyze
+4. Repeat until WNS >= 0 or 3 iterations
+5. Once timing is met, call "design-chip" for full PnR and "analyze-timing" on the result
+6. Report final timing, area, and power
+
+Design: ${pdk} @ ${freq_mhz} MHz
+\`\`\`verilog
+${verilog}
+\`\`\``,
+          },
+        },
+      ],
+    };
+  }
+);
+
+// ============================================================
+// PDK Resources
+// ============================================================
+
+server.resource(
+  {
+    uri: "pdk://sky130/summary",
+    name: "Sky130 PDK Summary",
+    description: "SkyWater Sky130 130nm process design kit specifications",
+    mimeType: "text/plain",
+  },
+  async () => ({
+    contents: [{ uri: "pdk://sky130/summary", text: `SkyWater Sky130 130nm PDK
+Process: 130nm CMOS, 5 metal layers (li1, met1-met5)
+Foundry: SkyWater Technology (Google-sponsored open-source)
+Voltage: 1.8V (core), 3.3V (I/O)
+Libraries: sky130_fd_sc_hd (high density), sky130_fd_sc_hs (high speed), sky130_fd_sc_hvl (high voltage)
+Cell count: ~430 cells (hd library)
+Min feature: 130nm gate length
+Metal stack: li1 (local interconnect) + 5 metal layers
+Tapeout: Available via Efabless/Google MPW shuttles and ChipIgnite
+Key design rules: min width 0.14um (met1), min spacing 0.14um (met1)
+Typical applications: IoT, microcontrollers, mixed-signal, educational` }],
+  })
+);
+
+server.resource(
+  {
+    uri: "pdk://gf180mcu/summary",
+    name: "GF180MCU PDK Summary",
+    description: "GlobalFoundries GF180MCU 180nm process design kit specifications",
+    mimeType: "text/plain",
+  },
+  async () => ({
+    contents: [{ uri: "pdk://gf180mcu/summary", text: `GlobalFoundries GF180MCU 180nm PDK
+Process: 180nm CMOS, 5 metal layers
+Foundry: GlobalFoundries (open-source)
+Voltage: 3.3V (core), 5V (I/O option)
+Libraries: gf180mcu_fd_sc_mcu7t5v0, gf180mcu_fd_sc_mcu9t5v0
+Cell count: ~300 cells per library
+Min feature: 180nm gate length
+Metal stack: 5 metal layers (met1-met5)
+Tapeout: Available via Efabless MPW shuttles
+Key design rules: min width 0.22um (met1), min spacing 0.22um (met1)
+Typical applications: MCU, power management, automotive, industrial` }],
+  })
+);
+
+server.resource(
+  {
+    uri: "pdk://asap7/summary",
+    name: "ASAP7 PDK Summary",
+    description: "Arizona State Predictive 7nm process design kit specifications",
+    mimeType: "text/plain",
+  },
+  async () => ({
+    contents: [{ uri: "pdk://asap7/summary", text: `ASAP7 Predictive 7nm PDK
+Process: 7nm FinFET (predictive/academic, NOT manufacturable)
+Source: Arizona State University + ARM
+Voltage: 0.7V nominal
+Libraries: asap7sc7p5t (7.5-track standard cells)
+Cell count: ~200 cells across 5 categories (AO, INVBUF, OA, SEQ, SIMPLE)
+Min feature: 7nm gate length (FinFET)
+Metal stack: 9 metal layers (M1-M9)
+Timing: Liberty files in ps (1ps time unit) -- SDC periods must be in ps
+Special: Split Liberty across 5 .lib/.lib.gz files, explicit make_tracks needed
+Typical applications: Academic research, algorithm benchmarking, predictive studies
+NOTE: This is a predictive PDK. Results approximate real 7nm but cannot be fabricated.` }],
+  })
+);
+
+server.resource(
+  {
+    uri: "pdk://ihp130/summary",
+    name: "IHP SG13G2 PDK Summary",
+    description: "IHP SG13G2 130nm BiCMOS process design kit specifications",
+    mimeType: "text/plain",
+  },
+  async () => ({
+    contents: [{ uri: "pdk://ihp130/summary", text: `IHP SG13G2 130nm BiCMOS PDK
+Process: 130nm SiGe BiCMOS, 7 metal layers (TM1-TM2 thick metal, M1-M5)
+Foundry: IHP GmbH (Leibniz Institute, Germany)
+Voltage: 1.2V (core), 3.3V (I/O)
+Libraries: sg13g2_stdcell (standard cells)
+Special: SiGe HBT transistors (fT > 300 GHz) for RF/analog
+Min feature: 130nm gate length
+Metal stack: 5 thin + 2 thick metal layers
+Tapeout: Available through IHP MPW service
+Key design rules: Compatible with standard 130nm CMOS rules
+Typical applications: RF front-ends, mmWave, 5G, radar, high-speed ADC/DAC` }],
+  })
 );
 
 server.listen().then(() => {
