@@ -59,7 +59,7 @@ function runOnEC2Raw(cmd: string, timeoutMs = 1800000): Promise<string> {
       port: 22,
       username: "ubuntu",
       privateKey: getSSHKey(),
-      readyTimeout: 15000,
+      readyTimeout: 30000,
     });
   });
 }
@@ -80,8 +80,8 @@ async function uploadFile(filename: string, content: string, dir?: string): Prom
     const conn = new Client();
     const timer = setTimeout(() => {
       conn.end();
-      reject(new Error("SFTP upload timed out after 30s"));
-    }, 30000);
+      reject(new Error("SFTP upload timed out after 60s"));
+    }, 60000);
 
     conn.on("ready", () => {
       conn.sftp((err, sftp) => {
@@ -110,7 +110,7 @@ async function uploadFile(filename: string, content: string, dir?: string): Prom
       port: 22,
       username: "ubuntu",
       privateKey: getSSHKey(),
-      readyTimeout: 15000,
+      readyTimeout: 30000,
     });
   });
 }
@@ -152,12 +152,12 @@ async function startBackgroundJob(
   const jobId = jobDir.split("/").pop() || "unknown";
   // Write metadata (design name, pdk, freq, start time)
   const metaJson = JSON.stringify({ ...meta, startTime: Date.now(), status: "running" });
-  await runOnEC2(`mkdir -p ${jobDir}/output && echo '${metaJson}' > ${jobDir}/meta.json`, 15000);
+  await runOnEC2(`mkdir -p ${jobDir}/output && echo '${metaJson}' > ${jobDir}/meta.json`, 30000);
   // Launch the actual command in background with nohup
   // The shell writes exit code to exit_code file when done
   const bgCmd = `nohup bash -c '${ZYPHAR_ENV} && ${cmd} > ${jobDir}/output.log 2>&1; echo $? > ${jobDir}/exit_code' > /dev/null 2>&1 & echo $!`;
-  const pid = (await runOnEC2(bgCmd, 15000)).trim();
-  await runOnEC2(`echo '${pid}' > ${jobDir}/pid`, 10000);
+  const pid = (await runOnEC2(bgCmd, 30000)).trim();
+  await runOnEC2(`echo '${pid}' > ${jobDir}/pid`, 30000);
   return { jobId, jobDir };
 }
 
