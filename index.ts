@@ -65,12 +65,49 @@ function runOnEC2(cmd: string, timeoutMs = 300000): Promise<string> {
 }
 
 async function uploadFile(filename: string, content: string, dir?: string): Promise<string> {
-  const jobId = Date.now().toString(36);
+  const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
   const jobDir = dir || `/tmp/mcp_jobs/${jobId}`;
   await runOnEC2(`mkdir -p ${jobDir}`);
-  // Quoted heredoc << 'EOF' preserves content literally -- no escaping needed
-  await runOnEC2(`cat > ${jobDir}/${filename} << 'ZYPHAR_EOF_MARKER'\n${content}\nZYPHAR_EOF_MARKER`);
-  return `${jobDir}/${filename}`;
+  const filePath = `${jobDir}/${filename}`;
+
+  // Use SFTP for reliable file transfer (heredoc fails on large files)
+  return new Promise((resolve, reject) => {
+    const conn = new Client();
+    const timer = setTimeout(() => {
+      conn.end();
+      reject(new Error("SFTP upload timed out after 30s"));
+    }, 30000);
+
+    conn.on("ready", () => {
+      conn.sftp((err, sftp) => {
+        if (err) {
+          clearTimeout(timer);
+          conn.end();
+          reject(err);
+          return;
+        }
+        sftp.writeFile(filePath, content, (err) => {
+          clearTimeout(timer);
+          conn.end();
+          if (err) reject(err);
+          else resolve(filePath);
+        });
+      });
+    });
+
+    conn.on("error", (err: Error) => {
+      clearTimeout(timer);
+      reject(new Error(`SFTP connection failed: ${err.message}`));
+    });
+
+    conn.connect({
+      host: EC2_HOST,
+      port: 22,
+      username: "ubuntu",
+      privateKey: getSSHKey(),
+      readyTimeout: 15000,
+    });
+  });
 }
 
 function extractTopModule(verilog: string): string {
@@ -201,20 +238,43 @@ server.tool(
     schema: z.object({
       design: z.enum(["picorv32", "uart_tx", "alu_8bit"]).describe("Which demo design to run"),
       freq_mhz: z.number().default(100).describe("Target clock frequency in MHz"),
+      pdk: z.enum(["sky130", "gf180mcu", "asap7"]).default("sky130").describe("Process design kit"),
     }),
+    widget: {
+      name: "chip-design-result",
+      invoking: "Running demo design...",
+      invoked: "Demo design complete",
+    },
   },
-  async ({ design, freq_mhz }) => {
+  async ({ design, freq_mhz, pdk }) => {
     const paths: Record<string, [string, string]> = {
       picorv32: ["/tmp/OpenROAD-flow-scripts/flow/designs/src/picorv32/picorv32.v", "picorv32"],
       uart_tx: ["~/Zyphar-new/test_designs/uart_tx.v", "uart_tx"],
       alu_8bit: ["~/Zyphar-new/test_designs/alu_8bit.v", "alu_8bit"],
     };
     const [path, top] = paths[design];
+    const jobDir = `/tmp/mcp_demo_${design}_${Date.now()}`;
     const output = await runOnEC2(
-      `./target/release/zyphar flow -i ${path} --top ${top} --pdk sky130 --freq ${freq_mhz} --output /tmp/mcp_demo_${design}_${Date.now()} 2>&1`,
+      `./target/release/zyphar flow -i ${path} --top ${top} --pdk ${pdk} --freq ${freq_mhz} --gds --output ${jobDir}/output 2>&1`,
       600000
     );
-    return text(output);
+    const stats = parseDesignStats(output);
+    const hasGds = await runOnEC2(`find ${jobDir}/output -name "*.gds" 2>/dev/null | head -1`).then(r => r.trim().length > 0).catch(() => false);
+    const pdkLabel: Record<string, string> = { sky130: "Sky130 130nm", gf180mcu: "GF180MCU 180nm", asap7: "ASAP7 7nm" };
+    return widget({
+      props: {
+        designName: `${top} (demo)`,
+        pdk: pdkLabel[pdk] || pdk,
+        cells: stats.cells || stats.instances || "N/A",
+        area: stats.area || "N/A",
+        wns: stats.wns || "N/A",
+        duration: stats.duration || "N/A",
+        hasGds: hasGds,
+        jobDir: jobDir,
+        filename: top,
+      },
+      output: text(output),
+    });
   }
 );
 
@@ -389,11 +449,11 @@ server.tool(
     }),
   },
   async ({ verilog, testbench }) => {
-    const jobId = Date.now().toString(36);
+    const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     const jobDir = `/tmp/mcp_sim/${jobId}`;
     await runOnEC2(`mkdir -p ${jobDir}`);
-    await runOnEC2(`cat > ${jobDir}/design.v << 'ZYPHAR_EOF_MARKER'\n${verilog}\nZYPHAR_EOF_MARKER`);
-    await runOnEC2(`cat > ${jobDir}/tb.v << 'ZYPHAR_EOF_MARKER'\n${testbench}\nZYPHAR_EOF_MARKER`);
+    await uploadFile("design.v", verilog, jobDir);
+    await uploadFile("tb.v", testbench, jobDir);
     const output = await runOnEC2(
       `cd ${jobDir} && iverilog -o sim.vvp design.v tb.v 2>&1 && timeout 10 vvp sim.vvp 2>&1`,
       30000
@@ -417,7 +477,7 @@ server.tool(
     const jobId = Date.now().toString(36);
     const jobDir = `/tmp/mcp_fpga/${jobId}`;
     await runOnEC2(`mkdir -p ${jobDir}`);
-    await runOnEC2(`cat > ${jobDir}/design.v << 'ZYPHAR_EOF_MARKER'\n${verilog}\nZYPHAR_EOF_MARKER`);
+    await uploadFile("design.v", verilog, jobDir);
 
     const fpgaCmd: Record<string, string> = {
       ice40: `synth_ice40 -top ${top} -json ${jobDir}/out.json`,
