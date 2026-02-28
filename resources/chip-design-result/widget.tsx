@@ -11,6 +11,7 @@ interface ChipDesignProps {
   hasGds?: boolean;
   jobDir?: string;
   filename?: string;
+  downloadUrl?: string | null;
 }
 
 const ChipDesignResult: React.FC = () => {
@@ -44,13 +45,33 @@ const ChipDesignResult: React.FC = () => {
     if (!props.jobDir || downloading) return;
     setDownloading(true);
     try {
+      if (props.downloadUrl) {
+        openExternal(props.downloadUrl);
+        return;
+      }
+
       const res = await callTool("download-gdsii", {
         job_dir: props.jobDir,
         filename: props.filename || "design",
       });
       const sc = res?.structuredContent as Record<string, string> | undefined;
+      if (sc?.downloadUrl) {
+        openExternal(sc.downloadUrl);
+        return;
+      }
       if (sc?.dataUrl) {
         openExternal(sc.dataUrl);
+        return;
+      }
+
+      const content = (res as any)?.content;
+      if (Array.isArray(content)) {
+        const textItem = content.find((item: any) => item?.type === "text");
+        const maybeText = typeof textItem?.text === "string" ? textItem.text : "";
+        const urlMatch = maybeText.match(/https?:\/\/\S+/);
+        if (urlMatch?.[0]) {
+          openExternal(urlMatch[0]);
+        }
       }
     } catch (err) {
       console.error("Download failed:", err);
