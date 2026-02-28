@@ -8,7 +8,24 @@ const EC2_HOST = process.env.EC2_HOST || "ec2-18-219-59-121.us-east-2.compute.am
 const ZYPHAR_ENV = "export PATH=$HOME/.cargo/bin:$PATH && export ORFS_PATH=/tmp/OpenROAD-flow-scripts && export IHP_PDK_PATH=/tmp/IHP-Open-PDK && cd ~/Zyphar-new";
 const CONVEX_SITE_URL = process.env.CONVEX_SITE_URL || "https://silent-iguana-375.convex.site";
 
-const convexUrl = process.env.CONVEX_URL;
+function deriveConvexCloudUrl(siteUrl: string): string | null {
+  try {
+    const parsed = new URL(siteUrl);
+    // Convex site URLs are typically "<deployment>.convex.site".
+    // ConvexHttpClient needs the cloud endpoint "<deployment>.convex.cloud".
+    if (parsed.hostname.endsWith(".convex.site")) {
+      const deployment = parsed.hostname.slice(0, -".convex.site".length);
+      if (deployment) {
+        return `https://${deployment}.convex.cloud`;
+      }
+    }
+  } catch {
+    // Ignore parse failures and fall back to explicit CONVEX_URL only.
+  }
+  return null;
+}
+
+const convexUrl = process.env.CONVEX_URL || deriveConvexCloudUrl(CONVEX_SITE_URL);
 const convex = convexUrl && convexUrl.startsWith("https://")
   ? new ConvexHttpClient(convexUrl)
   : null;
@@ -204,6 +221,55 @@ async function uploadFile(filename: string, content: string, dir?: string): Prom
   });
 }
 
+async function downloadFileBuffer(remotePath: string, timeoutMs = 300000): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const conn = new Client();
+    const chunks: Buffer[] = [];
+
+    const timer = setTimeout(() => {
+      conn.end();
+      reject(new Error(`SFTP download timed out after ${timeoutMs / 1000}s`));
+    }, timeoutMs);
+
+    conn.on("ready", () => {
+      conn.sftp((err, sftp) => {
+        if (err) {
+          clearTimeout(timer);
+          conn.end();
+          reject(err);
+          return;
+        }
+
+        const stream = sftp.createReadStream(remotePath);
+        stream.on("data", (chunk: Buffer) => chunks.push(chunk));
+        stream.on("error", (streamErr: Error) => {
+          clearTimeout(timer);
+          conn.end();
+          reject(streamErr);
+        });
+        stream.on("end", () => {
+          clearTimeout(timer);
+          conn.end();
+          resolve(Buffer.concat(chunks));
+        });
+      });
+    });
+
+    conn.on("error", () => {
+      clearTimeout(timer);
+      reject(new Error("SFTP connection failed. Check server configuration."));
+    });
+
+    conn.connect({
+      host: EC2_HOST,
+      port: 22,
+      username: "ubuntu",
+      privateKey: getSSHKey(),
+      readyTimeout: 30000,
+    });
+  });
+}
+
 function sanitizeOutput(output: string): string {
   return output
     .replace(/Yosys \d+\.\d+[^\n]*/g, "Zyphar Synthesis Engine")
@@ -242,22 +308,18 @@ async function uploadGdsToConvex(jobDir: string): Promise<{ url: string; fileId:
     )).trim();
     if (!gdsFile) return null;
 
-    // Get base64 of GDS from EC2
-    const b64 = (await runOnEC2Raw(
-      `base64 "${gdsFile}" | tr -d '\\n'`,
-      60000
-    )).trim();
-    if (b64.length < 100) return null;
+    // Download the binary directly via SFTP (robust for large GDS files).
+    const gdsBuffer = await downloadFileBuffer(gdsFile, 600000);
+    if (gdsBuffer.length < 100) return null;
 
     // Get upload URL from Convex
     const uploadUrl: string = await (convex as any).mutation("designs:generateUploadUrl");
 
     // Upload the binary data to Convex storage
-    const gdsBuffer = Buffer.from(b64, "base64");
     const response = await fetch(uploadUrl, {
       method: "POST",
       headers: { "Content-Type": "application/octet-stream" },
-      body: gdsBuffer,
+      body: gdsBuffer as any,
     });
     if (!response.ok) return null;
     const { storageId } = (await response.json()) as { storageId: string };
@@ -1752,3 +1814,4 @@ Typical applications: RF front-ends, mmWave, 5G, radar, high-speed ADC/DAC` }],
 server.listen().then(() => {
   console.log("Zyphar EDA MCP server running");
 });
+// force rebuild 1772268311
