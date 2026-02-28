@@ -1,13 +1,96 @@
-import { MCPServer, text, image, mix, widget } from "mcp-use/server";
+import { MCPServer, text, image, mix, widget, getRequestContext } from "mcp-use/server";
 import { z } from "zod";
 import { Client } from "ssh2";
 import { readFileSync } from "fs";
 import { ConvexHttpClient } from "convex/browser";
 
-const EC2_HOST = "ec2-18-219-59-121.us-east-2.compute.amazonaws.com";
+const EC2_HOST = process.env.EC2_HOST || "ec2-18-219-59-121.us-east-2.compute.amazonaws.com";
 const ZYPHAR_ENV = "export PATH=$HOME/.cargo/bin:$PATH && export ORFS_PATH=/tmp/OpenROAD-flow-scripts && export IHP_PDK_PATH=/tmp/IHP-Open-PDK && cd ~/Zyphar-new";
+const CONVEX_SITE_URL = process.env.CONVEX_SITE_URL || "https://silent-iguana-375.convex.site";
 
-const convex = process.env.CONVEX_URL ? new ConvexHttpClient(process.env.CONVEX_URL) : null;
+const convexUrl = process.env.CONVEX_URL;
+const convex = convexUrl && convexUrl.startsWith("https://")
+  ? new ConvexHttpClient(convexUrl)
+  : null;
+
+// Track validated users per request
+interface ValidatedUser {
+  userId: string;
+  email: string;
+  plan: string;
+  remaining: number;
+}
+
+// Validate API key against Convex backend
+async function validateApiKey(): Promise<ValidatedUser> {
+  const ctx = getRequestContext();
+  if (!ctx) {
+    throw new Error("No request context available");
+  }
+
+  const authHeader = ctx.req.header("Authorization");
+  if (!authHeader) {
+    throw new Error("Missing Authorization header. Add 'Authorization: Bearer YOUR_API_KEY' to your MCP configuration.");
+  }
+
+  const apiKey = authHeader.replace(/^Bearer\s+/i, "").trim();
+  if (!apiKey || !apiKey.startsWith("zp_")) {
+    throw new Error("Invalid API key format. Keys must start with 'zp_'. Get your API key at https://aule.compute");
+  }
+
+  // Validate against Convex
+  const response = await fetch(`${CONVEX_SITE_URL}/api/validate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ apiKey }),
+  });
+
+  const result = await response.json() as { valid: boolean; error?: string; userId?: string; email?: string; plan?: string; remaining?: number };
+
+  if (!result.valid) {
+    throw new Error(result.error || "Invalid API key");
+  }
+
+  return {
+    userId: result.userId!,
+    email: result.email || "",
+    plan: result.plan || "free",
+    remaining: result.remaining || 0,
+  };
+}
+
+// Record usage after successful tool execution
+async function recordUsage(tool: string, computeSeconds: number): Promise<void> {
+  const ctx = getRequestContext();
+  if (!ctx) return;
+  const authHeader = ctx.req.header("Authorization");
+  if (!authHeader) return;
+  const apiKey = authHeader.replace(/^Bearer\s+/i, "").trim();
+
+  try {
+    await fetch(`${CONVEX_SITE_URL}/api/record-usage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ apiKey, tool, computeSeconds }),
+    });
+  } catch {
+    // Best effort - don't fail the request
+  }
+}
+function shellEscape(s: string): string {
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
+function validateJobDir(dir: string): string {
+  const normalized = dir.replace(/\/+/g, "/").replace(/\/$/, "");
+  if (!/^\/tmp\/mcp_/.test(normalized)) {
+    throw new Error("Invalid job directory. Must start with /tmp/mcp_");
+  }
+  if (normalized.includes("..")) {
+    throw new Error("Invalid job directory. Path traversal not allowed.");
+  }
+  return normalized;
+}
 
 function getSSHKey(): string {
   if (process.env.SSH_PRIVATE_KEY_B64) {
@@ -52,9 +135,9 @@ function runOnEC2Raw(cmd: string, timeoutMs = 1800000): Promise<string> {
       });
     });
 
-    conn.on("error", (err: Error) => {
+    conn.on("error", () => {
       clearTimeout(timer);
-      reject(new Error(`SSH connection failed: ${err.message}. Ensure SSH_PRIVATE_KEY env var is set.`));
+      reject(new Error("SSH connection failed. Check server configuration."));
     });
 
     conn.connect({
@@ -73,9 +156,12 @@ async function runOnEC2(cmd: string, timeoutMs = 1800000): Promise<string> {
 }
 
 async function uploadFile(filename: string, content: string, dir?: string): Promise<string> {
+  if (/[\/\\]/.test(filename) || filename.includes("..")) {
+    throw new Error("Invalid filename");
+  }
   const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
   const jobDir = dir || `/tmp/mcp_jobs/${jobId}`;
-  await runOnEC2(`mkdir -p ${jobDir}`);
+  await runOnEC2(`mkdir -p ${shellEscape(jobDir)}`);
   const filePath = `${jobDir}/${filename}`;
 
   // Use SFTP for reliable file transfer (heredoc fails on large files)
@@ -103,9 +189,9 @@ async function uploadFile(filename: string, content: string, dir?: string): Prom
       });
     });
 
-    conn.on("error", (err: Error) => {
+    conn.on("error", () => {
       clearTimeout(timer);
-      reject(new Error(`SFTP connection failed: ${err.message}`));
+      reject(new Error("SFTP connection failed. Check server configuration."));
     });
 
     conn.connect({
@@ -150,8 +236,9 @@ function extractTopModule(verilog: string): string {
 async function uploadGdsToConvex(jobDir: string): Promise<{ url: string; fileId: string } | null> {
   if (!convex) return null;
   try {
+    const safeDir = validateJobDir(jobDir);
     const gdsFile = (await runOnEC2Raw(
-      `find ${jobDir}/output -name "*.gds" 2>/dev/null | head -1`
+      `find ${shellEscape(safeDir)}/output -name "*.gds" 2>/dev/null | head -1`
     )).trim();
     if (!gdsFile) return null;
 
@@ -190,15 +277,17 @@ async function startBackgroundJob(
   cmd: string,
   meta: Record<string, string> = {}
 ): Promise<{ jobId: string; jobDir: string }> {
-  const jobId = jobDir.split("/").pop() || "unknown";
-  // Write metadata (design name, pdk, freq, start time)
+  const safeDir = validateJobDir(jobDir);
+  const jobId = safeDir.split("/").pop() || "unknown";
+  // Write metadata via SFTP (safe -- no shell injection)
   const metaJson = JSON.stringify({ ...meta, startTime: Date.now(), status: "running" });
-  await runOnEC2(`mkdir -p ${jobDir}/output && echo '${metaJson}' > ${jobDir}/meta.json`, 30000);
+  await runOnEC2(`mkdir -p ${shellEscape(safeDir)}/output`, 30000);
+  await uploadFile("meta.json", metaJson, safeDir);
   // Launch the actual command in background with nohup
   // The shell writes exit code to exit_code file when done
-  const bgCmd = `nohup bash -c '${ZYPHAR_ENV} && ${cmd} > ${jobDir}/output.log 2>&1; echo $? > ${jobDir}/exit_code' > /dev/null 2>&1 & echo $!`;
+  const bgCmd = `nohup bash -c '${ZYPHAR_ENV} && ${cmd} > ${shellEscape(safeDir)}/output.log 2>&1; echo $? > ${shellEscape(safeDir)}/exit_code' > /dev/null 2>&1 & echo $!`;
   const pid = (await runOnEC2(bgCmd, 30000)).trim();
-  await runOnEC2(`echo '${pid}' > ${jobDir}/pid`, 30000);
+  await uploadFile("pid", pid, safeDir);
 
   // Record design in Convex (best-effort)
   if (convex) {
@@ -226,10 +315,12 @@ interface JobStatus {
 }
 
 async function checkJobStatus(jobDir: string): Promise<JobStatus> {
+  const safeDir = validateJobDir(jobDir);
+  const jobId = safeDir.split("/").pop() || "unknown";
   // Read metadata for start time
   let startTime = Date.now();
   try {
-    const metaRaw = await runOnEC2(`cat ${jobDir}/meta.json 2>/dev/null || echo '{}'`, 10000);
+    const metaRaw = await runOnEC2(`cat ${shellEscape(safeDir)}/meta.json 2>/dev/null || echo '{}'`, 10000);
     const meta = JSON.parse(metaRaw.trim());
     if (meta.startTime) startTime = meta.startTime;
   } catch { /* use current time as fallback */ }
@@ -238,7 +329,7 @@ async function checkJobStatus(jobDir: string): Promise<JobStatus> {
 
   // Check if exit_code file exists (means job finished)
   const exitCheck = (await runOnEC2(
-    `[ -f ${jobDir}/exit_code ] && echo "DONE:$(cat ${jobDir}/exit_code)" || echo "RUNNING"`,
+    `[ -f ${shellEscape(safeDir)}/exit_code ] && echo "DONE:$(cat ${shellEscape(safeDir)}/exit_code)" || echo "RUNNING"`,
     10000
   )).trim();
 
@@ -246,17 +337,16 @@ async function checkJobStatus(jobDir: string): Promise<JobStatus> {
     // Check if process is still alive
     let processAlive = false;
     try {
-      const pidRaw = (await runOnEC2(`cat ${jobDir}/pid 2>/dev/null || echo ""`, 10000)).trim();
-      if (pidRaw) {
+      const pidRaw = (await runOnEC2(`cat ${shellEscape(safeDir)}/pid 2>/dev/null || echo ""`, 10000)).trim();
+      if (pidRaw && /^\d+$/.test(pidRaw)) {
         const psCheck = (await runOnEC2(`kill -0 ${pidRaw} 2>/dev/null && echo "ALIVE" || echo "DEAD"`, 10000)).trim();
         processAlive = psCheck === "ALIVE";
       }
     } catch { /* ignore */ }
 
     if (!processAlive) {
-      // Process died without writing exit_code -- check if log exists
       try {
-        const tailLog = await runOnEC2(`tail -20 ${jobDir}/output.log 2>/dev/null || echo "No log file"`, 10000);
+        const tailLog = await runOnEC2(`tail -20 ${shellEscape(safeDir)}/output.log 2>/dev/null || echo "No log file"`, 10000);
         return { state: "failed", elapsedSeconds, output: `Process died unexpectedly.\nLast log lines:\n${tailLog.trim()}` };
       } catch {
         return { state: "failed", elapsedSeconds, output: "Process died unexpectedly. No log available." };
@@ -267,7 +357,7 @@ async function checkJobStatus(jobDir: string): Promise<JobStatus> {
 
   // Job finished -- parse exit code
   const exitCode = exitCheck.replace("DONE:", "").trim();
-  const output = await runOnEC2(`cat ${jobDir}/output.log 2>/dev/null || echo ""`, 30000);
+  const output = await runOnEC2(`cat ${shellEscape(safeDir)}/output.log 2>/dev/null || echo ""`, 30000);
 
   if (exitCode !== "0") {
     const lastLines = output.split("\n").slice(-30).join("\n");
@@ -277,30 +367,51 @@ async function checkJobStatus(jobDir: string): Promise<JobStatus> {
   // Success -- parse stats and check for GDS
   const stats = parseDesignStats(output);
   const hasGds = await runOnEC2(
-    `find ${jobDir}/output -name "*.gds" 2>/dev/null | head -1`
+    `find ${shellEscape(safeDir)}/output -name "*.gds" 2>/dev/null | head -1`
   ).then(r => r.trim().length > 0).catch(() => false);
 
-  // Auto-upload GDS to Convex storage for easy download
+  // Prefer existing Convex storage object for this job to avoid re-uploading on every poll.
   let downloadUrl: string | undefined;
-  if (hasGds) {
-    const result = await uploadGdsToConvex(jobDir);
+  let gdsFileIdForRecord: string | undefined;
+  if (convex) {
+    try {
+      const existing = await (convex as any).query("designs:getDesign", { jobId });
+      if (existing?.gdsFileId) {
+        gdsFileIdForRecord = existing.gdsFileId;
+        const existingUrl: string | null = await (convex as any).query("designs:getDownloadUrl", {
+          fileId: existing.gdsFileId,
+        });
+        if (existingUrl) downloadUrl = existingUrl;
+      }
+    } catch {
+      // Best effort; fall through to upload.
+    }
+  }
+
+  // Upload GDS once if not already in Convex.
+  if (hasGds && !downloadUrl) {
+    const result = await uploadGdsToConvex(safeDir);
     if (result) {
       downloadUrl = result.url;
-      // Record in Convex DB
-      const jobId = jobDir.split("/").pop() || "unknown";
-      try {
-        if (convex) {
-          await (convex as any).mutation("designs:completeDesign", {
-            jobId,
-            status: "completed",
-            cells: stats.cells || stats.instances,
-            area: stats.area,
-            wns: stats.wns,
-            duration: stats.duration || `${elapsedSeconds}s`,
-            gdsFileId: result.fileId,
-          });
-        }
-      } catch { /* DB record is best-effort */ }
+      gdsFileIdForRecord = result.fileId;
+    }
+  }
+
+  // Always mark the design completed in Convex, even when GDS upload fails.
+  if (convex) {
+    try {
+      const completeArgs: Record<string, string | undefined> = {
+        jobId,
+        status: "completed",
+        cells: stats.cells || stats.instances,
+        area: stats.area,
+        wns: stats.wns,
+        duration: stats.duration || `${elapsedSeconds}s`,
+      };
+      if (gdsFileIdForRecord) completeArgs.gdsFileId = gdsFileIdForRecord;
+      await (convex as any).mutation("designs:completeDesign", completeArgs);
+    } catch {
+      // DB record is best-effort.
     }
   }
 
@@ -321,10 +432,11 @@ function parseDesignStats(output: string): Record<string, string> {
   return stats;
 }
 
-async function getGdsiiBase64(jobDir: string, top: string): Promise<string | null> {
+async function getGdsiiBase64(jobDir: string, _top: string): Promise<string | null> {
   try {
+    const safeDir = validateJobDir(jobDir);
     const b64 = await runOnEC2(
-      `gds_file=$(find ${jobDir}/output -name "*.gds" 2>/dev/null | head -1) && [ -f "$gds_file" ] && base64 "$gds_file" | tr -d '\\n' || echo "NO_GDS"`,
+      `gds_file=$(find ${shellEscape(safeDir)}/output -name "*.gds" 2>/dev/null | head -1) && [ -f "$gds_file" ] && base64 "$gds_file" | tr -d '\\n' || echo "NO_GDS"`,
       30000
     );
     if (b64.trim() === "NO_GDS" || b64.trim().length < 100) return null;
@@ -336,17 +448,18 @@ async function getGdsiiBase64(jobDir: string, top: string): Promise<string | nul
 
 async function extract3DLayout(jobDir: string): Promise<any | null> {
   try {
+    const safeDir = validateJobDir(jobDir);
     const gdsFile = (await runOnEC2(
-      `find ${jobDir}/output -name "*.gds" 2>/dev/null | head -1`
+      `find ${shellEscape(safeDir)}/output -name "*.gds" 2>/dev/null | head -1`
     )).trim();
     if (!gdsFile) return null;
-    const jsonPath = `${jobDir}/output/layout_3d.json`;
+    const jsonPath = `${safeDir}/output/layout_3d.json`;
     const result = await runOnEC2(
-      `GDS_PATH=${gdsFile} OUT_PATH=${jsonPath} klayout -b -r /tmp/extract_3d.py 2>&1`,
+      `GDS_PATH=${shellEscape(gdsFile)} OUT_PATH=${shellEscape(jsonPath)} klayout -b -r /tmp/extract_3d.py 2>&1`,
       30000
     );
     if (!result.includes("OK")) return null;
-    const json = await runOnEC2(`cat ${jsonPath}`);
+    const json = await runOnEC2(`cat ${shellEscape(jsonPath)}`);
     return JSON.parse(json);
   } catch {
     return null;
@@ -355,14 +468,15 @@ async function extract3DLayout(jobDir: string): Promise<any | null> {
 
 async function renderLayoutPng(jobDir: string): Promise<string | null> {
   try {
-    const jsonPath = `${jobDir}/output/layout_3d.json`;
-    const pngPath = `${jobDir}/output/layout.png`;
+    const safeDir = validateJobDir(jobDir);
+    const jsonPath = `${safeDir}/output/layout_3d.json`;
+    const pngPath = `${safeDir}/output/layout.png`;
     const result = await runOnEC2(
-      `JSON_PATH=${jsonPath} OUT_PATH=${pngPath} python3 /tmp/render_layout.py 2>&1`,
+      `JSON_PATH=${shellEscape(jsonPath)} OUT_PATH=${shellEscape(pngPath)} python3 /tmp/render_layout.py 2>&1`,
       15000
     );
     if (!result.includes("OK")) return null;
-    const b64 = await runOnEC2(`base64 ${pngPath} | tr -d '\\n'`, 15000);
+    const b64 = await runOnEC2(`base64 ${shellEscape(pngPath)} | tr -d '\\n'`, 15000);
     if (b64.trim().length > 100) return b64.trim();
     return null;
   } catch {
@@ -383,18 +497,19 @@ server.tool(
     name: "design-chip",
     description: "Start the full RTL-to-GDSII chip design flow on Verilog source code. Launches synthesis + place & route as a background job and returns immediately with a job directory. Use get-job-status to poll for results.",
     schema: z.object({
-      verilog: z.string().describe("Complete Verilog source code for the design"),
-      top_module: z.string().optional().describe("Top-level module name. Auto-detected from Verilog if omitted."),
+      verilog: z.string().max(10_000_000).describe("Complete Verilog source code for the design"),
+      top_module: z.string().max(256).optional().describe("Top-level module name. Auto-detected from Verilog if omitted."),
       pdk: z.enum(["sky130", "gf180mcu", "asap7", "ihp130"]).default("sky130").describe("Process design kit: sky130 (130nm), gf180mcu (180nm), asap7 (7nm predictive), ihp130 (IHP SG13G2 130nm)"),
-      freq_mhz: z.number().default(100).describe("Target clock frequency in MHz"),
-      clock_port: z.string().default("clk").describe("Name of the clock port in the design"),
+      freq_mhz: z.number().min(1).max(10000).default(100).describe("Target clock frequency in MHz"),
+      clock_port: z.string().max(256).default("clk").describe("Name of the clock port in the design"),
     }),
   },
   async ({ verilog, top_module, pdk, freq_mhz, clock_port }) => {
+    await validateApiKey();
     const top = top_module || extractTopModule(verilog);
     const inputPath = await uploadFile("input.v", verilog);
     const jobDir = inputPath.replace("/input.v", "");
-    const flowCmd = `./target/release/zyphar flow -i ${inputPath} --top ${top} --pdk ${pdk} --freq ${freq_mhz} --clock ${clock_port} --util 0.50 --gds --detailed-route --output ${jobDir}/output`;
+    const flowCmd = `./target/release/zyphar flow -i ${shellEscape(inputPath)} --top ${shellEscape(top)} --pdk ${shellEscape(pdk)} --freq ${freq_mhz} --clock ${shellEscape(clock_port)} --util 0.50 --gds --detailed-route --output ${shellEscape(jobDir)}/output`;
     const { jobDir: jd } = await startBackgroundJob(jobDir, flowCmd, {
       designName: top, pdk, freq: String(freq_mhz), tool: "design-chip",
     });
@@ -412,11 +527,12 @@ server.tool(
     description: "Start a pre-validated demo design as a background job. Available designs: picorv32 (RISC-V CPU, ~14K cells), uart_tx (UART transmitter, ~100 cells), alu_8bit (8-bit ALU, ~255 cells). Returns immediately with a job directory. Use get-job-status to poll for results.",
     schema: z.object({
       design: z.enum(["picorv32", "uart_tx", "alu_8bit"]).describe("Which demo design to run"),
-      freq_mhz: z.number().default(100).describe("Target clock frequency in MHz"),
+      freq_mhz: z.number().min(1).max(10000).default(100).describe("Target clock frequency in MHz"),
       pdk: z.enum(["sky130", "gf180mcu", "asap7", "ihp130"]).default("sky130").describe("Process design kit"),
     }),
   },
   async ({ design, freq_mhz, pdk }) => {
+    await validateApiKey();
     const paths: Record<string, [string, string]> = {
       picorv32: ["/tmp/OpenROAD-flow-scripts/flow/designs/src/picorv32/picorv32.v", "picorv32"],
       uart_tx: ["~/Zyphar-new/test_designs/uart_tx.v", "uart_tx"],
@@ -424,7 +540,7 @@ server.tool(
     };
     const [path, top] = paths[design];
     const jobDir = `/tmp/mcp_demo_${design}_${Date.now()}`;
-    const flowCmd = `./target/release/zyphar flow -i ${path} --top ${top} --pdk ${pdk} --freq ${freq_mhz} --gds --detailed-route --output ${jobDir}/output`;
+    const flowCmd = `./target/release/zyphar flow -i ${shellEscape(path)} --top ${shellEscape(top)} --pdk ${shellEscape(pdk)} --freq ${freq_mhz} --gds --detailed-route --output ${shellEscape(jobDir)}/output`;
     const { jobDir: jd } = await startBackgroundJob(jobDir, flowCmd, {
       designName: `${top} (demo)`, pdk, freq: String(freq_mhz), tool: "run-demo-design",
     });
@@ -441,17 +557,18 @@ server.tool(
     name: "synthesize",
     description: "Synthesize Verilog source code to a gate-level netlist. Returns cell count, area breakdown, and the synthesized netlist. Faster than full design-chip since it skips place & route.",
     schema: z.object({
-      verilog: z.string().describe("Complete Verilog source code"),
-      top_module: z.string().optional().describe("Top-level module name. Auto-detected from Verilog if omitted."),
+      verilog: z.string().max(10_000_000).describe("Complete Verilog source code"),
+      top_module: z.string().max(256).optional().describe("Top-level module name. Auto-detected from Verilog if omitted."),
       pdk: z.enum(["sky130", "gf180mcu", "asap7", "ihp130"]).default("sky130"),
     }),
   },
   async ({ verilog, top_module, pdk }) => {
+    await validateApiKey();
     const top = top_module || extractTopModule(verilog);
     const inputPath = await uploadFile("input.v", verilog);
     const jobDir = inputPath.replace("/input.v", "");
     const output = await runOnEC2(
-      `./target/release/zyphar flow -i ${inputPath} --top ${top} --pdk ${pdk} --skip-pnr --output ${jobDir}/output 2>&1`
+      `./target/release/zyphar flow -i ${shellEscape(inputPath)} --top ${shellEscape(top)} --pdk ${shellEscape(pdk)} --skip-pnr --output ${shellEscape(jobDir)}/output 2>&1`
     );
     return text(output);
   }
@@ -462,12 +579,13 @@ server.tool(
     name: "estimate-ppa",
     description: "Quick power-performance-area estimate from cell count. No EDA tools needed -- returns instantly. Useful for early design exploration before running the full flow.",
     schema: z.object({
-      cells: z.number().describe("Estimated number of standard cells"),
+      cells: z.number().min(1).max(100_000_000).describe("Estimated number of standard cells"),
       pdk: z.enum(["sky130", "gf180mcu", "asap7", "ihp130"]).default("sky130"),
-      freq_mhz: z.number().default(100).describe("Target clock frequency in MHz"),
+      freq_mhz: z.number().min(1).max(10000).default(100).describe("Target clock frequency in MHz"),
     }),
   },
   async ({ cells, pdk, freq_mhz }) => {
+    await validateApiKey();
     const params: Record<string, [number, number, number]> = {
       sky130: [2.0, 0.01, 0.1],
       gf180mcu: [1.6, 0.008, 0.085],
@@ -497,18 +615,19 @@ server.tool(
     name: "design-chip-signoff",
     description: "Start full RTL-to-GDSII flow WITH signoff verification (DRC + LVS) as a background job. Returns immediately with a job directory. Use get-job-status to poll for results.",
     schema: z.object({
-      verilog: z.string().describe("Complete Verilog source code for the design"),
-      top_module: z.string().optional().describe("Top-level module name. Auto-detected from Verilog if omitted."),
+      verilog: z.string().max(10_000_000).describe("Complete Verilog source code for the design"),
+      top_module: z.string().max(256).optional().describe("Top-level module name. Auto-detected from Verilog if omitted."),
       pdk: z.enum(["sky130", "gf180mcu", "asap7", "ihp130"]).default("sky130"),
-      freq_mhz: z.number().default(100).describe("Target clock frequency in MHz"),
-      clock_port: z.string().default("clk").describe("Name of the clock port"),
+      freq_mhz: z.number().min(1).max(10000).default(100).describe("Target clock frequency in MHz"),
+      clock_port: z.string().max(256).default("clk").describe("Name of the clock port"),
     }),
   },
   async ({ verilog, top_module, pdk, freq_mhz, clock_port }) => {
+    await validateApiKey();
     const top = top_module || extractTopModule(verilog);
     const inputPath = await uploadFile("input.v", verilog);
     const jobDir = inputPath.replace("/input.v", "");
-    const flowCmd = `./target/release/zyphar flow -i ${inputPath} --top ${top} --pdk ${pdk} --freq ${freq_mhz} --clock ${clock_port} --util 0.50 --output ${jobDir}/output --signoff --gds --detailed-route`;
+    const flowCmd = `./target/release/zyphar flow -i ${shellEscape(inputPath)} --top ${shellEscape(top)} --pdk ${shellEscape(pdk)} --freq ${freq_mhz} --clock ${shellEscape(clock_port)} --util 0.50 --output ${shellEscape(jobDir)}/output --signoff --gds --detailed-route`;
     const { jobDir: jd } = await startBackgroundJob(jobDir, flowCmd, {
       designName: top, pdk, freq: String(freq_mhz), tool: "design-chip-signoff",
     });
@@ -525,7 +644,7 @@ server.tool(
     name: "get-job-status",
     description: "Check the status of a running chip design job. Returns results when complete, elapsed time when still running, or error details if failed. Use this after design-chip, design-chip-signoff, or run-demo-design to poll for completion.",
     schema: z.object({
-      job_dir: z.string().describe("The job directory returned by design-chip, design-chip-signoff, or run-demo-design"),
+      job_dir: z.string().max(512).describe("The job directory returned by design-chip, design-chip-signoff, or run-demo-design"),
     }),
     widget: {
       name: "chip-design-result",
@@ -534,12 +653,14 @@ server.tool(
     },
   },
   async ({ job_dir }) => {
-    const status = await checkJobStatus(job_dir);
+    await validateApiKey();
+    const safeDir = validateJobDir(job_dir);
+    const status = await checkJobStatus(safeDir);
 
     if (status.state === "running") {
       return text(
         `Job is still running. Elapsed: ${status.elapsedSeconds}s\n` +
-        `Job directory: ${job_dir}\n\n` +
+        `Job directory: ${safeDir}\n\n` +
         `Call get-job-status again to check progress.`
       );
     }
@@ -552,7 +673,7 @@ server.tool(
     let designName = "unknown";
     let pdkStr = "unknown";
     try {
-      const metaRaw = await runOnEC2(`cat ${job_dir}/meta.json 2>/dev/null || echo '{}'`, 10000);
+      const metaRaw = await runOnEC2(`cat ${shellEscape(safeDir)}/meta.json 2>/dev/null || echo '{}'`, 10000);
       const meta = JSON.parse(metaRaw.trim());
       designName = meta.designName || "unknown";
       pdkStr = meta.pdk || "unknown";
@@ -574,7 +695,7 @@ server.tool(
         wns: stats.wns || "N/A",
         duration: stats.duration || `${status.elapsedSeconds}s`,
         hasGds: status.hasGds || false,
-        jobDir: job_dir,
+        jobDir: safeDir,
         filename: designName.replace(/ \(demo\)$/, ""),
         downloadUrl: status.downloadUrl || null,
       },
@@ -588,7 +709,7 @@ server.tool(
     name: "view-chip-3d",
     description: "Render an interactive 3D visualization of a chip layout. Extracts real polygon data from the GDSII file and displays it as a rotatable, zoomable 3D model with all physical layers (diffusion, poly, metal1-5, vias). Call this AFTER design-chip or design-chip-signoff to visualize the result.",
     schema: z.object({
-      job_dir: z.string().describe("The job directory from a previous design-chip run (shown in the output path)"),
+      job_dir: z.string().max(512).describe("The job directory from a previous design-chip run (shown in the output path)"),
     }),
     widget: {
       name: "chip-layout",
@@ -597,13 +718,15 @@ server.tool(
     },
   },
   async ({ job_dir }) => {
-    const layout3d = await extract3DLayout(job_dir);
+    await validateApiKey();
+    const safeDir = validateJobDir(job_dir);
+    const layout3d = await extract3DLayout(safeDir);
     if (!layout3d) {
       return text("No GDSII file found. Run design-chip first.");
     }
     const totalPolys = layout3d.layers.reduce((s: number, l: any) => s + l.polygons.length, 0);
     const summary = `Chip Layout: ${layout3d.die.w.toFixed(1)} x ${layout3d.die.h.toFixed(1)} um die, ${layout3d.layers.length} layers, ${totalPolys} polygons`;
-    const pngB64 = await renderLayoutPng(job_dir);
+    const pngB64 = await renderLayoutPng(safeDir);
     if (pngB64) {
       return widget({
         props: {
@@ -625,20 +748,67 @@ server.tool(
     name: "download-gdsii",
     description: "Download the GDSII layout file from a completed chip design job. Returns a temporary download URL valid for 24 hours.",
     schema: z.object({
-      job_dir: z.string().describe("The job directory from a previous design-chip run"),
-      filename: z.string().default("design").describe("Base filename for the downloaded .gds file"),
+      job_dir: z.string().max(512).describe("The job directory from a previous design-chip run"),
+      filename: z.string().max(256).default("design").describe("Base filename for the downloaded .gds file"),
     }),
   },
   async ({ job_dir, filename }) => {
-    // Try Convex storage (preferred -- real download link)
-    const result = await uploadGdsToConvex(job_dir);
-    if (result) {
-      return text(`GDSII file ready for download:\n${result.url}`);
+    await validateApiKey();
+    const safeDir = validateJobDir(job_dir);
+    const jobId = safeDir.split("/").pop() || "unknown";
+    if (/[\/\\]/.test(filename) || filename.includes("..")) {
+      return text("Invalid filename.");
     }
+    // Try existing Convex storage first (preferred -- stable real download link).
+    if (convex) {
+      try {
+        const existing = await (convex as any).query("designs:getDesign", { jobId });
+        if (existing?.gdsFileId) {
+          const url: string | null = await (convex as any).query("designs:getDownloadUrl", {
+            fileId: existing.gdsFileId,
+          });
+          if (url) {
+            return {
+              content: [{ type: "text" as const, text: `GDSII file ready for download:\n${url}` }],
+              structuredContent: {
+                downloadUrl: url,
+                filename: `${filename}.gds`,
+              },
+            };
+          }
+        }
+      } catch {
+        // Fall through to upload attempt.
+      }
+    }
+
+    // Upload to Convex storage if not already present.
+    const result = await uploadGdsToConvex(safeDir);
+    if (result) {
+      if (convex) {
+        try {
+          await (convex as any).mutation("designs:completeDesign", {
+            jobId,
+            status: "completed",
+            gdsFileId: result.fileId,
+          });
+        } catch {
+          // Best effort.
+        }
+      }
+      return {
+        content: [{ type: "text" as const, text: `GDSII file ready for download:\n${result.url}` }],
+        structuredContent: {
+          downloadUrl: result.url,
+          filename: `${filename}.gds`,
+        },
+      };
+    }
+
     // Fallback to base64 if Convex is not configured
-    const b64 = await getGdsiiBase64(job_dir, filename);
+    const b64 = await getGdsiiBase64(safeDir, filename);
     if (!b64) {
-      return text("No GDSII file found in " + job_dir);
+      return text("No GDSII file found in job directory.");
     }
     return {
       content: [{ type: "text" as const, text: `GDSII file ready: ${filename}.gds` }],
@@ -655,18 +825,19 @@ server.tool(
     name: "simulate",
     description: "Simulate a Verilog design with a testbench. Proves functional correctness -- does the design actually do what it should? Returns simulation output including $display/$monitor messages. The testbench should use $finish to end simulation.",
     schema: z.object({
-      verilog: z.string().describe("Complete Verilog source code for the design under test"),
-      testbench: z.string().describe("Verilog testbench that instantiates the design, drives inputs, and checks outputs using $display and $finish"),
+      verilog: z.string().max(10_000_000).describe("Complete Verilog source code for the design under test"),
+      testbench: z.string().max(10_000_000).describe("Verilog testbench that instantiates the design, drives inputs, and checks outputs using $display and $finish"),
     }),
   },
   async ({ verilog, testbench }) => {
+    await validateApiKey();
     const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     const jobDir = `/tmp/mcp_sim/${jobId}`;
-    await runOnEC2(`mkdir -p ${jobDir}`);
+    await runOnEC2(`mkdir -p ${shellEscape(jobDir)}`);
     await uploadFile("design.v", verilog, jobDir);
     await uploadFile("tb.v", testbench, jobDir);
     const output = await runOnEC2(
-      `cd ${jobDir} && iverilog -o sim.vvp design.v tb.v 2>&1 && timeout 10 vvp sim.vvp 2>&1`,
+      `cd ${shellEscape(jobDir)} && iverilog -o sim.vvp design.v tb.v 2>&1 && timeout 10 vvp sim.vvp 2>&1`,
       30000
     );
     return text(output);
@@ -678,26 +849,27 @@ server.tool(
     name: "fpga-synthesize",
     description: "Synthesize Verilog for FPGA. Maps the design to FPGA primitives (LUTs, flip-flops, BRAMs) and reports resource utilization. Proves the design can run on real FPGA hardware. Supported targets: ice40 (Lattice iCE40), ecp5 (Lattice ECP5), xilinx (Xilinx 7-series).",
     schema: z.object({
-      verilog: z.string().describe("Complete Verilog source code"),
-      top_module: z.string().optional().describe("Top-level module name. Auto-detected if omitted."),
+      verilog: z.string().max(10_000_000).describe("Complete Verilog source code"),
+      top_module: z.string().max(256).optional().describe("Top-level module name. Auto-detected if omitted."),
       fpga: z.enum(["ice40", "ecp5", "xilinx"]).default("ice40").describe("FPGA target: ice40 (Lattice iCE40 HX8K), ecp5 (Lattice ECP5), xilinx (Xilinx 7-series)"),
     }),
   },
   async ({ verilog, top_module, fpga }) => {
+    await validateApiKey();
     const top = top_module || extractTopModule(verilog);
     const jobId = Date.now().toString(36);
     const jobDir = `/tmp/mcp_fpga/${jobId}`;
-    await runOnEC2(`mkdir -p ${jobDir}`);
+    await runOnEC2(`mkdir -p ${shellEscape(jobDir)}`);
     await uploadFile("design.v", verilog, jobDir);
 
     const fpgaCmd: Record<string, string> = {
-      ice40: `synth_ice40 -top ${top} -json ${jobDir}/out.json`,
-      ecp5: `synth_ecp5 -top ${top} -json ${jobDir}/out.json`,
-      xilinx: `synth_xilinx -top ${top} -json ${jobDir}/out.json`,
+      ice40: `synth_ice40 -top ${shellEscape(top)} -json ${shellEscape(jobDir)}/out.json`,
+      ecp5: `synth_ecp5 -top ${shellEscape(top)} -json ${shellEscape(jobDir)}/out.json`,
+      xilinx: `synth_xilinx -top ${shellEscape(top)} -json ${shellEscape(jobDir)}/out.json`,
     };
 
     const output = await runOnEC2(
-      `yosys -p "read_verilog ${jobDir}/design.v; ${fpgaCmd[fpga]}; stat" 2>&1`,
+      `yosys -p "read_verilog ${shellEscape(jobDir)}/design.v; ${fpgaCmd[fpga]}; stat" 2>&1`,
       60000
     );
     // Extract just the stat summary (after "Printing statistics.")
@@ -720,11 +892,11 @@ server.tool(
     name: "analyze-timing",
     description: "Run static timing analysis on a completed design. Returns worst negative slack (WNS), total negative slack (TNS), critical path details, and slack histogram. Requires a completed job from design-chip, or provide a netlist directly.",
     schema: z.object({
-      job_dir: z.string().optional().describe("Job directory from a previous design-chip run. Reuses the PnR results for accurate post-route timing."),
-      netlist: z.string().optional().describe("Gate-level Verilog netlist (alternative to job_dir)"),
+      job_dir: z.string().max(512).optional().describe("Job directory from a previous design-chip run. Reuses the PnR results for accurate post-route timing."),
+      netlist: z.string().max(10_000_000).optional().describe("Gate-level Verilog netlist (alternative to job_dir)"),
       pdk: z.enum(["sky130", "gf180mcu", "asap7", "ihp130"]).default("sky130").describe("PDK (required if providing netlist directly)"),
-      freq_mhz: z.number().default(100).describe("Target clock frequency in MHz"),
-      clock_port: z.string().default("clk").describe("Clock port name"),
+      freq_mhz: z.number().min(1).max(10000).default(100).describe("Target clock frequency in MHz"),
+      clock_port: z.string().max(256).default("clk").describe("Clock port name"),
     }),
     widget: {
       name: "timing-report",
@@ -733,18 +905,19 @@ server.tool(
     },
   },
   async ({ job_dir, netlist, pdk, freq_mhz, clock_port }) => {
+    await validateApiKey();
     let netlistPath: string;
     let jobDir: string;
 
     if (job_dir) {
-      jobDir = job_dir;
+      jobDir = validateJobDir(job_dir);
       // Find the netlist from the completed job
       netlistPath = (await runOnEC2(
-        `find ${job_dir}/output -name "*.v" -o -name "*.vg" 2>/dev/null | head -1`,
+        `find ${shellEscape(jobDir)}/output -name "*.v" -o -name "*.vg" 2>/dev/null | head -1`,
         10000
       )).trim();
       if (!netlistPath) {
-        return text(`No netlist found in ${job_dir}/output. Ensure design-chip completed successfully.`);
+        return text("No netlist found in job output. Ensure design-chip completed successfully.");
       }
     } else if (netlist) {
       const uploaded = await uploadFile("netlist.v", netlist);
@@ -756,7 +929,7 @@ server.tool(
 
     const period = (1000 / freq_mhz).toFixed(3);
     const output = await runOnEC2(
-      `./target/release/zyphar sta --netlist ${netlistPath} --pdk ${pdk} --clock-port ${clock_port} --clock-period ${period} 2>&1`,
+      `./target/release/zyphar sta --netlist ${shellEscape(netlistPath)} --pdk ${shellEscape(pdk)} --clock-port ${shellEscape(clock_port)} --clock-period ${period} 2>&1`,
       60000
     );
 
@@ -789,7 +962,7 @@ server.tool(
     name: "check-drc",
     description: "Run design rule checking (DRC) on a GDSII layout from a completed design job. Reports violations by type and layer. Requires a completed job with GDS output (use design-chip-signoff or design-chip with --gds).",
     schema: z.object({
-      job_dir: z.string().describe("Job directory from a previous design-chip or design-chip-signoff run"),
+      job_dir: z.string().max(512).describe("Job directory from a previous design-chip or design-chip-signoff run"),
     }),
     widget: {
       name: "verification-report",
@@ -798,31 +971,28 @@ server.tool(
     },
   },
   async ({ job_dir }) => {
+    await validateApiKey();
+    const safeDir = validateJobDir(job_dir);
     // Find GDS and determine top module
     const gdsFile = (await runOnEC2(
-      `find ${job_dir}/output -name "*.gds" 2>/dev/null | head -1`,
+      `find ${shellEscape(safeDir)}/output -name "*.gds" 2>/dev/null | head -1`,
       10000
     )).trim();
     if (!gdsFile) {
-      return text(`No GDSII file found in ${job_dir}/output. Run design-chip with --gds first.`);
+      return text("No GDSII file found. Run design-chip with --gds first.");
     }
 
     let top = "unknown";
-    try {
-      const metaRaw = await runOnEC2(`cat ${job_dir}/meta.json 2>/dev/null || echo '{}'`, 10000);
-      const meta = JSON.parse(metaRaw.trim());
-      top = (meta.designName || "unknown").replace(/ \(demo\)$/, "");
-    } catch { /* ignore */ }
-
     let pdkStr = "sky130";
     try {
-      const metaRaw = await runOnEC2(`cat ${job_dir}/meta.json 2>/dev/null || echo '{}'`, 10000);
+      const metaRaw = await runOnEC2(`cat ${shellEscape(safeDir)}/meta.json 2>/dev/null || echo '{}'`, 10000);
       const meta = JSON.parse(metaRaw.trim());
+      top = (meta.designName || "unknown").replace(/ \(demo\)$/, "");
       pdkStr = meta.pdk || "sky130";
     } catch { /* ignore */ }
 
     const output = await runOnEC2(
-      `./target/release/zyphar drc --gds ${gdsFile} --top ${top} --pdk ${pdkStr} 2>&1`,
+      `./target/release/zyphar drc --gds ${shellEscape(gdsFile)} --top ${shellEscape(top)} --pdk ${shellEscape(pdkStr)} 2>&1`,
       120000
     );
 
@@ -850,7 +1020,7 @@ server.tool(
     name: "check-lvs",
     description: "Run layout vs. schematic (LVS) checking on a completed design. Compares the physical layout (GDS) against the logical netlist to verify they match. Requires a completed job with GDS output.",
     schema: z.object({
-      job_dir: z.string().describe("Job directory from a previous design-chip or design-chip-signoff run"),
+      job_dir: z.string().max(512).describe("Job directory from a previous design-chip or design-chip-signoff run"),
     }),
     widget: {
       name: "verification-report",
@@ -859,30 +1029,32 @@ server.tool(
     },
   },
   async ({ job_dir }) => {
+    await validateApiKey();
+    const safeDir = validateJobDir(job_dir);
     const gdsFile = (await runOnEC2(
-      `find ${job_dir}/output -name "*.gds" 2>/dev/null | head -1`,
+      `find ${shellEscape(safeDir)}/output -name "*.gds" 2>/dev/null | head -1`,
       10000
     )).trim();
     if (!gdsFile) {
-      return text(`No GDSII file found in ${job_dir}/output. Run design-chip with --gds first.`);
+      return text("No GDSII file found. Run design-chip with --gds first.");
     }
 
     const netlistFile = (await runOnEC2(
-      `find ${job_dir}/output -name "*.v" -o -name "*.vg" 2>/dev/null | head -1`,
+      `find ${shellEscape(safeDir)}/output -name "*.v" -o -name "*.vg" 2>/dev/null | head -1`,
       10000
     )).trim();
 
     let top = "unknown";
     let pdkStr = "sky130";
     try {
-      const metaRaw = await runOnEC2(`cat ${job_dir}/meta.json 2>/dev/null || echo '{}'`, 10000);
+      const metaRaw = await runOnEC2(`cat ${shellEscape(safeDir)}/meta.json 2>/dev/null || echo '{}'`, 10000);
       const meta = JSON.parse(metaRaw.trim());
       top = (meta.designName || "unknown").replace(/ \(demo\)$/, "");
       pdkStr = meta.pdk || "sky130";
     } catch { /* ignore */ }
 
     const output = await runOnEC2(
-      `./target/release/zyphar lvs --gds ${gdsFile} --netlist ${netlistFile} --top ${top} --pdk ${pdkStr} 2>&1`,
+      `./target/release/zyphar lvs --gds ${shellEscape(gdsFile)} --netlist ${shellEscape(netlistFile)} --top ${shellEscape(top)} --pdk ${shellEscape(pdkStr)} 2>&1`,
       120000
     );
 
@@ -910,23 +1082,25 @@ server.tool(
     name: "analyze-power",
     description: "Estimate power consumption of a completed design. Reports total, leakage, and dynamic power breakdown. Requires a completed PnR job or a gate-level netlist.",
     schema: z.object({
-      job_dir: z.string().optional().describe("Job directory from a previous design-chip run"),
-      netlist: z.string().optional().describe("Gate-level Verilog netlist (alternative to job_dir)"),
+      job_dir: z.string().max(512).optional().describe("Job directory from a previous design-chip run"),
+      netlist: z.string().max(10_000_000).optional().describe("Gate-level Verilog netlist (alternative to job_dir)"),
       pdk: z.enum(["sky130", "gf180mcu", "asap7", "ihp130"]).default("sky130"),
-      freq_mhz: z.number().default(100).describe("Target clock frequency in MHz"),
+      freq_mhz: z.number().min(1).max(10000).default(100).describe("Target clock frequency in MHz"),
     }),
   },
   async ({ job_dir, netlist, pdk, freq_mhz }) => {
+    await validateApiKey();
     let defPath: string | null = null;
     let netlistPath: string | null = null;
 
     if (job_dir) {
+      const safeDir = validateJobDir(job_dir);
       defPath = (await runOnEC2(
-        `find ${job_dir}/output -name "*.def" 2>/dev/null | head -1`,
+        `find ${shellEscape(safeDir)}/output -name "*.def" 2>/dev/null | head -1`,
         10000
       )).trim() || null;
       netlistPath = (await runOnEC2(
-        `find ${job_dir}/output -name "*.v" -o -name "*.vg" 2>/dev/null | head -1`,
+        `find ${shellEscape(safeDir)}/output -name "*.v" -o -name "*.vg" 2>/dev/null | head -1`,
         10000
       )).trim() || null;
     } else if (netlist) {
@@ -942,9 +1116,9 @@ server.tool(
     }
 
     const period = (1000 / freq_mhz).toFixed(3);
-    const inputFlag = defPath ? `--def ${defPath}` : `--netlist ${netlistPath}`;
+    const inputFlag = defPath ? `--def ${shellEscape(defPath)}` : `--netlist ${shellEscape(netlistPath!)}`;
     const output = await runOnEC2(
-      `./target/release/zyphar power ${inputFlag} --pdk ${pdk} --clock-period ${period} 2>&1`,
+      `./target/release/zyphar power ${inputFlag} --pdk ${shellEscape(pdk)} --clock-period ${period} 2>&1`,
       30000
     );
 
@@ -957,22 +1131,23 @@ server.tool(
     name: "analyze-cdc",
     description: "Detect clock domain crossings (CDC) in a gate-level netlist. Identifies signals that cross between clock domains without proper synchronization. Optionally inserts synchronizers.",
     schema: z.object({
-      netlist: z.string().describe("Gate-level Verilog netlist to analyze"),
+      netlist: z.string().max(10_000_000).describe("Gate-level Verilog netlist to analyze"),
       fix: z.boolean().default(false).describe("If true, insert synchronizers and return the fixed netlist"),
     }),
   },
   async ({ netlist, fix }) => {
+    await validateApiKey();
     const uploaded = await uploadFile("cdc_input.v", netlist);
     const jobDir = uploaded.replace("/cdc_input.v", "");
-    const fixFlag = fix ? `--fix --output ${jobDir}/cdc_fixed.v` : "";
+    const fixFlag = fix ? `--fix --output ${shellEscape(jobDir)}/cdc_fixed.v` : "";
     const output = await runOnEC2(
-      `./target/release/zyphar cdc --netlist ${uploaded} ${fixFlag} 2>&1`,
+      `./target/release/zyphar cdc --netlist ${shellEscape(uploaded)} ${fixFlag} 2>&1`,
       30000
     );
 
     if (fix) {
       try {
-        const fixed = await runOnEC2(`cat ${jobDir}/cdc_fixed.v 2>/dev/null`, 10000);
+        const fixed = await runOnEC2(`cat ${shellEscape(jobDir)}/cdc_fixed.v 2>/dev/null`, 10000);
         if (fixed.trim().length > 0) {
           return text(`${output}\n\n--- Fixed Netlist ---\n${fixed}`);
         }
@@ -988,20 +1163,21 @@ server.tool(
     name: "verify-equivalence",
     description: "Formally verify that a gate-level netlist is logically equivalent to the original RTL. Uses SAT-based equivalence checking. Proves synthesis did not introduce bugs.",
     schema: z.object({
-      rtl: z.string().describe("Original RTL Verilog source code"),
-      netlist: z.string().describe("Gate-level netlist to verify against RTL"),
-      top_module: z.string().describe("Top-level module name"),
+      rtl: z.string().max(10_000_000).describe("Original RTL Verilog source code"),
+      netlist: z.string().max(10_000_000).describe("Gate-level netlist to verify against RTL"),
+      top_module: z.string().max(256).describe("Top-level module name"),
     }),
   },
   async ({ rtl, netlist, top_module }) => {
+    await validateApiKey();
     const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     const jobDir = `/tmp/mcp_fec/${jobId}`;
-    await runOnEC2(`mkdir -p ${jobDir}`);
+    await runOnEC2(`mkdir -p ${shellEscape(jobDir)}`);
     await uploadFile("rtl.v", rtl, jobDir);
     await uploadFile("netlist.v", netlist, jobDir);
 
     const output = await runOnEC2(
-      `./target/release/zyphar formal equiv --reference ${jobDir}/rtl.v --implementation ${jobDir}/netlist.v --top ${top_module} 2>&1`,
+      `./target/release/zyphar formal equiv --reference ${shellEscape(jobDir)}/rtl.v --implementation ${shellEscape(jobDir)}/netlist.v --top ${shellEscape(top_module)} 2>&1`,
       60000
     );
 
@@ -1022,19 +1198,20 @@ server.tool(
     name: "place-and-route",
     description: "Run standalone place & route on an existing gate-level netlist. Use this when you already have a synthesized netlist and want to generate a physical layout. Launches as a background job.",
     schema: z.object({
-      netlist: z.string().describe("Gate-level Verilog netlist"),
-      top_module: z.string().optional().describe("Top-level module name. Auto-detected if omitted."),
+      netlist: z.string().max(10_000_000).describe("Gate-level Verilog netlist"),
+      top_module: z.string().max(256).optional().describe("Top-level module name. Auto-detected if omitted."),
       pdk: z.enum(["sky130", "gf180mcu", "asap7", "ihp130"]).default("sky130"),
-      freq_mhz: z.number().default(100).describe("Target clock frequency in MHz"),
-      clock_port: z.string().default("clk").describe("Clock port name"),
-      utilization: z.number().default(0.45).describe("Target utilization (0.0 to 1.0)"),
+      freq_mhz: z.number().min(1).max(10000).default(100).describe("Target clock frequency in MHz"),
+      clock_port: z.string().max(256).default("clk").describe("Clock port name"),
+      utilization: z.number().min(0.01).max(1.0).default(0.45).describe("Target utilization (0.0 to 1.0)"),
     }),
   },
   async ({ netlist, top_module, pdk, freq_mhz, clock_port, utilization }) => {
+    await validateApiKey();
     const top = top_module || extractTopModule(netlist);
     const inputPath = await uploadFile("netlist.v", netlist);
     const jobDir = inputPath.replace("/netlist.v", "");
-    const flowCmd = `./target/release/zyphar flow -i ${inputPath} --top ${top} --pdk ${pdk} --freq ${freq_mhz} --clock ${clock_port} --skip-synth --util ${utilization} --gds --detailed-route --output ${jobDir}/output`;
+    const flowCmd = `./target/release/zyphar flow -i ${shellEscape(inputPath)} --top ${shellEscape(top)} --pdk ${shellEscape(pdk)} --freq ${freq_mhz} --clock ${shellEscape(clock_port)} --skip-synth --util ${utilization} --gds --detailed-route --output ${shellEscape(jobDir)}/output`;
     const { jobDir: jd } = await startBackgroundJob(jobDir, flowCmd, {
       designName: top, pdk, freq: String(freq_mhz), tool: "place-and-route",
     });
@@ -1051,16 +1228,17 @@ server.tool(
     name: "compile-memory",
     description: "Generate an SRAM macro. Produces LEF, GDS, Liberty, and Verilog models for the specified memory configuration. Currently supports Sky130 PDK.",
     schema: z.object({
-      words: z.number().describe("Number of words (rows) in the SRAM"),
-      bits: z.number().describe("Number of bits per word (columns)"),
+      words: z.number().int().min(1).max(65536).describe("Number of words (rows) in the SRAM"),
+      bits: z.number().int().min(1).max(1024).describe("Number of bits per word (columns)"),
       pdk: z.enum(["sky130"]).default("sky130").describe("PDK for memory compilation (Sky130 only)"),
     }),
   },
   async ({ words, bits, pdk }) => {
+    await validateApiKey();
     const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     const jobDir = `/tmp/mcp_sram/${jobId}`;
     const output = await runOnEC2(
-      `mkdir -p ${jobDir} && ./target/release/zyphar memory --words ${words} --bits ${bits} --pdk ${pdk} --output-dir ${jobDir} 2>&1`,
+      `mkdir -p ${shellEscape(jobDir)} && ./target/release/zyphar memory --words ${words} --bits ${bits} --pdk ${shellEscape(pdk)} --output-dir ${shellEscape(jobDir)} 2>&1`,
       60000
     );
     return text(output);
@@ -1072,30 +1250,35 @@ server.tool(
     name: "assemble-chip",
     description: "Assemble a chip with I/O pad ring and power distribution network around an existing placed-and-routed design. Launches as a background job.",
     schema: z.object({
-      job_dir: z.string().describe("Job directory from a completed place-and-route or design-chip job"),
-      die_size: z.string().default("2000x2000").describe("Die size in microns, format: WIDTHxHEIGHT"),
-      power_pads: z.number().default(4).describe("Number of VDD power pads"),
-      ground_pads: z.number().default(4).describe("Number of VSS ground pads"),
+      job_dir: z.string().max(512).describe("Job directory from a completed place-and-route or design-chip job"),
+      die_size: z.string().max(20).default("2000x2000").describe("Die size in microns, format: WIDTHxHEIGHT"),
+      power_pads: z.number().int().min(1).max(100).default(4).describe("Number of VDD power pads"),
+      ground_pads: z.number().int().min(1).max(100).default(4).describe("Number of VSS ground pads"),
     }),
   },
   async ({ job_dir, die_size, power_pads, ground_pads }) => {
+    await validateApiKey();
+    const safeDir = validateJobDir(job_dir);
+    if (!/^\d+x\d+$/.test(die_size)) {
+      return text("Invalid die_size format. Expected WIDTHxHEIGHT (e.g., 2000x2000)");
+    }
     const defFile = (await runOnEC2(
-      `find ${job_dir}/output -name "*.def" 2>/dev/null | head -1`,
+      `find ${shellEscape(safeDir)}/output -name "*.def" 2>/dev/null | head -1`,
       10000
     )).trim();
     if (!defFile) {
-      return text(`No DEF file found in ${job_dir}/output. Run design-chip or place-and-route first.`);
+      return text("No DEF file found. Run design-chip or place-and-route first.");
     }
 
     let pdkStr = "sky130";
     try {
-      const metaRaw = await runOnEC2(`cat ${job_dir}/meta.json 2>/dev/null || echo '{}'`, 10000);
+      const metaRaw = await runOnEC2(`cat ${shellEscape(safeDir)}/meta.json 2>/dev/null || echo '{}'`, 10000);
       const meta = JSON.parse(metaRaw.trim());
       pdkStr = meta.pdk || "sky130";
     } catch { /* ignore */ }
 
     const chipDir = `/tmp/mcp_chip_${Date.now().toString(36)}`;
-    const chipCmd = `./target/release/zyphar chip --def ${defFile} --die-size ${die_size} --pdk ${pdkStr} --power-pads ${power_pads} --ground-pads ${ground_pads} --output ${chipDir}/output`;
+    const chipCmd = `./target/release/zyphar chip --def ${shellEscape(defFile)} --die-size ${die_size} --pdk ${shellEscape(pdkStr)} --power-pads ${power_pads} --ground-pads ${ground_pads} --output ${shellEscape(chipDir)}/output`;
     const { jobDir: jd } = await startBackgroundJob(chipDir, chipCmd, {
       designName: `chip-assembly`, pdk: pdkStr, tool: "assemble-chip",
     });
@@ -1112,32 +1295,34 @@ server.tool(
     name: "wrap-caravel",
     description: "Wrap a completed design into a Caravel SoC harness for Google/Efabless tapeout on Sky130. Produces a submission-ready package. Launches as a background job.",
     schema: z.object({
-      job_dir: z.string().describe("Job directory from a completed design-chip or design-chip-signoff run"),
+      job_dir: z.string().max(512).describe("Job directory from a completed design-chip or design-chip-signoff run"),
       variant: z.enum(["caravel", "caravan", "user-project-wrapper"]).default("user-project-wrapper").describe("Caravel integration variant"),
     }),
   },
   async ({ job_dir, variant }) => {
+    await validateApiKey();
+    const safeDir = validateJobDir(job_dir);
     const gdsFile = (await runOnEC2(
-      `find ${job_dir}/output -name "*.gds" 2>/dev/null | head -1`,
+      `find ${shellEscape(safeDir)}/output -name "*.gds" 2>/dev/null | head -1`,
       10000
     )).trim();
     if (!gdsFile) {
-      return text(`No GDSII file found in ${job_dir}/output. Run design-chip with --gds first.`);
+      return text("No GDSII file found. Run design-chip with --gds first.");
     }
     const netlistFile = (await runOnEC2(
-      `find ${job_dir}/output -name "*.v" -o -name "*.vg" 2>/dev/null | head -1`,
+      `find ${shellEscape(safeDir)}/output -name "*.v" -o -name "*.vg" 2>/dev/null | head -1`,
       10000
     )).trim();
 
     let top = "unknown";
     try {
-      const metaRaw = await runOnEC2(`cat ${job_dir}/meta.json 2>/dev/null || echo '{}'`, 10000);
+      const metaRaw = await runOnEC2(`cat ${shellEscape(safeDir)}/meta.json 2>/dev/null || echo '{}'`, 10000);
       const meta = JSON.parse(metaRaw.trim());
       top = (meta.designName || "unknown").replace(/ \(demo\)$/, "");
     } catch { /* ignore */ }
 
     const caravelDir = `/tmp/mcp_caravel_${Date.now().toString(36)}`;
-    const caravelCmd = `./target/release/zyphar caravel --user-macro ${gdsFile} --netlist ${netlistFile} --top ${top} --variant ${variant} --output ${caravelDir}/output`;
+    const caravelCmd = `./target/release/zyphar caravel --user-macro ${shellEscape(gdsFile)} --netlist ${shellEscape(netlistFile)} --top ${shellEscape(top)} --variant ${shellEscape(variant)} --output ${shellEscape(caravelDir)}/output`;
     const { jobDir: jd } = await startBackgroundJob(caravelDir, caravelCmd, {
       designName: `${top}-caravel`, pdk: "sky130", tool: "wrap-caravel",
     });
@@ -1158,19 +1343,20 @@ server.tool(
     name: "lint-verilog",
     description: "Run lint checks on Verilog source code before synthesis. Catches common coding errors, undriven signals, width mismatches, and style issues. Fast pre-synthesis validation.",
     schema: z.object({
-      verilog: z.string().describe("Verilog source code to lint"),
-      top_module: z.string().optional().describe("Top-level module name. Auto-detected if omitted."),
+      verilog: z.string().max(10_000_000).describe("Verilog source code to lint"),
+      top_module: z.string().max(256).optional().describe("Top-level module name. Auto-detected if omitted."),
     }),
   },
   async ({ verilog, top_module }) => {
+    await validateApiKey();
     const top = top_module || extractTopModule(verilog);
     const jobId = Date.now().toString(36);
     const jobDir = `/tmp/mcp_lint/${jobId}`;
-    await runOnEC2(`mkdir -p ${jobDir}`);
+    await runOnEC2(`mkdir -p ${shellEscape(jobDir)}`);
     await uploadFile("design.v", verilog, jobDir);
 
     const output = await runOnEC2(
-      `verilator --lint-only -Wall --top-module ${top} ${jobDir}/design.v 2>&1`,
+      `verilator --lint-only -Wall --top-module ${shellEscape(top)} ${shellEscape(jobDir)}/design.v 2>&1`,
       15000
     );
 
@@ -1193,21 +1379,23 @@ server.tool(
     name: "netlist-stats",
     description: "Analyze a gate-level netlist or Verilog design and report statistics: cell types, hierarchy, fanout distribution, area by module.",
     schema: z.object({
-      job_dir: z.string().optional().describe("Job directory from a previous design-chip run (uses synthesized netlist)"),
-      verilog: z.string().optional().describe("Verilog source or netlist to analyze (alternative to job_dir)"),
+      job_dir: z.string().max(512).optional().describe("Job directory from a previous design-chip run (uses synthesized netlist)"),
+      verilog: z.string().max(10_000_000).optional().describe("Verilog source or netlist to analyze (alternative to job_dir)"),
       pdk: z.enum(["sky130", "gf180mcu", "asap7", "ihp130"]).default("sky130"),
     }),
   },
   async ({ job_dir, verilog, pdk }) => {
+    await validateApiKey();
     let inputPath: string;
 
     if (job_dir) {
+      const safeDir = validateJobDir(job_dir);
       inputPath = (await runOnEC2(
-        `find ${job_dir}/output -name "*.v" -o -name "*.vg" 2>/dev/null | head -1`,
+        `find ${shellEscape(safeDir)}/output -name "*.v" -o -name "*.vg" 2>/dev/null | head -1`,
         10000
       )).trim();
       if (!inputPath) {
-        return text(`No netlist found in ${job_dir}/output.`);
+        return text("No netlist found in job output.");
       }
     } else if (verilog) {
       inputPath = await uploadFile("stats_input.v", verilog);
@@ -1216,7 +1404,7 @@ server.tool(
     }
 
     const output = await runOnEC2(
-      `yosys -p "read_verilog ${inputPath}; hierarchy -auto-top; stat" 2>&1`,
+      `yosys -p "read_verilog ${shellEscape(inputPath)}; hierarchy -auto-top; stat" 2>&1`,
       15000
     );
 
@@ -1232,14 +1420,15 @@ server.tool(
     name: "design-sweep",
     description: "Run multi-variant design exploration by sweeping across frequencies and/or PDKs. Launches parallel synthesis+PnR jobs and returns a comparison table. Use get-job-status to poll each variant.",
     schema: z.object({
-      verilog: z.string().describe("Complete Verilog source code"),
-      top_module: z.string().optional().describe("Top-level module name"),
-      frequencies: z.array(z.number()).default([100]).describe("List of target frequencies in MHz to sweep"),
+      verilog: z.string().max(10_000_000).describe("Complete Verilog source code"),
+      top_module: z.string().max(256).optional().describe("Top-level module name"),
+      frequencies: z.array(z.number().min(1).max(10000)).default([100]).describe("List of target frequencies in MHz to sweep"),
       pdks: z.array(z.enum(["sky130", "gf180mcu", "asap7", "ihp130"])).default(["sky130"]).describe("List of PDKs to sweep"),
-      clock_port: z.string().default("clk").describe("Clock port name"),
+      clock_port: z.string().max(256).default("clk").describe("Clock port name"),
     }),
   },
   async ({ verilog, top_module, frequencies, pdks, clock_port }) => {
+    await validateApiKey();
     const top = top_module || extractTopModule(verilog);
     const sweepId = Date.now().toString(36);
     const sweepDir = `/tmp/mcp_sweep/${sweepId}`;
@@ -1250,7 +1439,7 @@ server.tool(
     for (const pdk of pdks) {
       for (const freq of frequencies) {
         const variantDir = `${sweepDir}/${pdk}_${freq}mhz`;
-        const flowCmd = `./target/release/zyphar flow -i ${inputPath} --top ${top} --pdk ${pdk} --freq ${freq} --clock ${clock_port} --util 0.50 --gds --detailed-route --output ${variantDir}/output`;
+        const flowCmd = `./target/release/zyphar flow -i ${shellEscape(inputPath)} --top ${shellEscape(top)} --pdk ${shellEscape(pdk)} --freq ${freq} --clock ${shellEscape(clock_port)} --util 0.50 --gds --detailed-route --output ${shellEscape(variantDir)}/output`;
         const { jobDir: jd } = await startBackgroundJob(variantDir, flowCmd, {
           designName: `${top} (${pdk}@${freq}MHz)`, pdk, freq: String(freq), tool: "design-sweep",
         });
@@ -1280,6 +1469,7 @@ server.prompt(
     }),
   },
   async ({ description }) => {
+    await validateApiKey();
     return {
       messages: [
         {
@@ -1391,6 +1581,7 @@ server.prompt(
     }),
   },
   async ({ job_dir, verilog }) => {
+    await validateApiKey();
     return {
       messages: [
         {
@@ -1431,6 +1622,7 @@ server.prompt(
     }),
   },
   async ({ verilog, freq_mhz, pdk }) => {
+    await validateApiKey();
     return {
       messages: [
         {
