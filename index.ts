@@ -353,7 +353,8 @@ async function uploadGdsToConvex(jobDir: string): Promise<{ url: string; fileId:
 async function startBackgroundJob(
   jobDir: string,
   cmd: string,
-  meta: Record<string, string> = {}
+  meta: Record<string, string> = {},
+  apiKey?: string
 ): Promise<{ jobId: string; jobDir: string }> {
   const safeDir = validateJobDir(jobDir);
   const jobId = safeDir.split("/").pop() || "unknown";
@@ -367,7 +368,7 @@ async function startBackgroundJob(
   const pid = (await runOnEC2(bgCmd, 30000)).trim();
   await uploadFile("pid", pid, safeDir);
 
-  // Record design in Convex (best-effort)
+  // Record design in Convex (best-effort) - link to user via API key
   if (convex) {
     try {
       await (convex as any).mutation("designs:createDesign", {
@@ -375,6 +376,7 @@ async function startBackgroundJob(
         designName: meta.designName || "unknown",
         pdk: meta.pdk || "unknown",
         tool: meta.tool || "design-chip",
+        apiKey: apiKey || undefined,
       });
     } catch { /* best-effort */ }
   }
@@ -584,14 +586,14 @@ server.tool(
     }),
   },
   async ({ verilog, top_module, pdk, freq_mhz, clock_port }, ctx) => {
-    requireAuth(ctx);
+    const auth = requireAuth(ctx);
     const top = top_module || extractTopModule(verilog);
     const inputPath = await uploadFile("input.v", verilog);
     const jobDir = inputPath.replace("/input.v", "");
     const flowCmd = `./target/release/zyphar flow -i ${shellEscape(inputPath)} --top ${shellEscape(top)} --pdk ${shellEscape(pdk)} --freq ${freq_mhz} --clock ${shellEscape(clock_port)} --util 0.50 --gds --detailed-route --output ${shellEscape(jobDir)}/output`;
     const { jobDir: jd } = await startBackgroundJob(jobDir, flowCmd, {
       designName: top, pdk, freq: String(freq_mhz), tool: "design-chip",
-    });
+    }, auth.apiKey);
     return text(
       `Job started. Design: ${top}, PDK: ${pdk}, Freq: ${freq_mhz} MHz\n` +
       `Job directory: ${jd}\n\n` +
@@ -611,7 +613,7 @@ server.tool(
     }),
   },
   async ({ design, freq_mhz, pdk }, ctx) => {
-    requireAuth(ctx);
+    const auth = requireAuth(ctx);
     const paths: Record<string, [string, string]> = {
       picorv32: ["/tmp/OpenROAD-flow-scripts/flow/designs/src/picorv32/picorv32.v", "picorv32"],
       uart_tx: ["~/Zyphar-new/test_designs/uart_tx.v", "uart_tx"],
@@ -622,7 +624,7 @@ server.tool(
     const flowCmd = `./target/release/zyphar flow -i ${shellEscape(path)} --top ${shellEscape(top)} --pdk ${shellEscape(pdk)} --freq ${freq_mhz} --gds --detailed-route --output ${shellEscape(jobDir)}/output`;
     const { jobDir: jd } = await startBackgroundJob(jobDir, flowCmd, {
       designName: `${top} (demo)`, pdk, freq: String(freq_mhz), tool: "run-demo-design",
-    });
+    }, auth.apiKey);
     return text(
       `Demo job started. Design: ${top}, PDK: ${pdk}, Freq: ${freq_mhz} MHz\n` +
       `Job directory: ${jd}\n\n` +
@@ -702,14 +704,14 @@ server.tool(
     }),
   },
   async ({ verilog, top_module, pdk, freq_mhz, clock_port }, ctx) => {
-    requireAuth(ctx);
+    const auth = requireAuth(ctx);
     const top = top_module || extractTopModule(verilog);
     const inputPath = await uploadFile("input.v", verilog);
     const jobDir = inputPath.replace("/input.v", "");
     const flowCmd = `./target/release/zyphar flow -i ${shellEscape(inputPath)} --top ${shellEscape(top)} --pdk ${shellEscape(pdk)} --freq ${freq_mhz} --clock ${shellEscape(clock_port)} --util 0.50 --output ${shellEscape(jobDir)}/output --signoff --gds --detailed-route`;
     const { jobDir: jd } = await startBackgroundJob(jobDir, flowCmd, {
       designName: top, pdk, freq: String(freq_mhz), tool: "design-chip-signoff",
-    });
+    }, auth.apiKey);
     return text(
       `Signoff job started. Design: ${top}, PDK: ${pdk}, Freq: ${freq_mhz} MHz\n` +
       `Job directory: ${jd}\n\n` +
@@ -1279,14 +1281,14 @@ server.tool(
     }),
   },
   async ({ netlist, top_module, pdk, freq_mhz, clock_port, utilization }, ctx) => {
-    requireAuth(ctx);
+    const auth = requireAuth(ctx);
     const top = top_module || extractTopModule(netlist);
     const inputPath = await uploadFile("netlist.v", netlist);
     const jobDir = inputPath.replace("/netlist.v", "");
     const flowCmd = `./target/release/zyphar flow -i ${shellEscape(inputPath)} --top ${shellEscape(top)} --pdk ${shellEscape(pdk)} --freq ${freq_mhz} --clock ${shellEscape(clock_port)} --skip-synth --util ${utilization} --gds --detailed-route --output ${shellEscape(jobDir)}/output`;
     const { jobDir: jd } = await startBackgroundJob(jobDir, flowCmd, {
       designName: top, pdk, freq: String(freq_mhz), tool: "place-and-route",
-    });
+    }, auth.apiKey);
     return text(
       `PnR job started. Design: ${top}, PDK: ${pdk}, Freq: ${freq_mhz} MHz, Util: ${utilization}\n` +
       `Job directory: ${jd}\n\n` +
@@ -1329,7 +1331,7 @@ server.tool(
     }),
   },
   async ({ job_dir, die_size, power_pads, ground_pads }, ctx) => {
-    requireAuth(ctx);
+    const auth = requireAuth(ctx);
     const safeDir = validateJobDir(job_dir);
     if (!/^\d+x\d+$/.test(die_size)) {
       return text("Invalid die_size format. Expected WIDTHxHEIGHT (e.g., 2000x2000)");
@@ -1353,7 +1355,7 @@ server.tool(
     const chipCmd = `./target/release/zyphar chip --def ${shellEscape(defFile)} --die-size ${die_size} --pdk ${shellEscape(pdkStr)} --power-pads ${power_pads} --ground-pads ${ground_pads} --output ${shellEscape(chipDir)}/output`;
     const { jobDir: jd } = await startBackgroundJob(chipDir, chipCmd, {
       designName: `chip-assembly`, pdk: pdkStr, tool: "assemble-chip",
-    });
+    }, auth.apiKey);
     return text(
       `Chip assembly job started. Die: ${die_size} um, Pads: ${power_pads} VDD + ${ground_pads} VSS\n` +
       `Job directory: ${jd}\n\n` +
@@ -1372,7 +1374,7 @@ server.tool(
     }),
   },
   async ({ job_dir, variant }, ctx) => {
-    requireAuth(ctx);
+    const auth = requireAuth(ctx);
     const safeDir = validateJobDir(job_dir);
     const gdsFile = (await runOnEC2(
       `find ${shellEscape(safeDir)}/output -name "*.gds" 2>/dev/null | head -1`,
@@ -1397,7 +1399,7 @@ server.tool(
     const caravelCmd = `./target/release/zyphar caravel --user-macro ${shellEscape(gdsFile)} --netlist ${shellEscape(netlistFile)} --top ${shellEscape(top)} --variant ${shellEscape(variant)} --output ${shellEscape(caravelDir)}/output`;
     const { jobDir: jd } = await startBackgroundJob(caravelDir, caravelCmd, {
       designName: `${top}-caravel`, pdk: "sky130", tool: "wrap-caravel",
-    });
+    }, auth.apiKey);
     return text(
       `Caravel wrap job started. Design: ${top}, Variant: ${variant}\n` +
       `Job directory: ${jd}\n\n` +
@@ -1500,7 +1502,7 @@ server.tool(
     }),
   },
   async ({ verilog, top_module, frequencies, pdks, clock_port }, ctx) => {
-    requireAuth(ctx);
+    const auth = requireAuth(ctx);
     const top = top_module || extractTopModule(verilog);
     const sweepId = Date.now().toString(36);
     const sweepDir = `/tmp/mcp_sweep/${sweepId}`;
@@ -1514,7 +1516,7 @@ server.tool(
         const flowCmd = `./target/release/zyphar flow -i ${shellEscape(inputPath)} --top ${shellEscape(top)} --pdk ${shellEscape(pdk)} --freq ${freq} --clock ${shellEscape(clock_port)} --util 0.50 --gds --detailed-route --output ${shellEscape(variantDir)}/output`;
         const { jobDir: jd } = await startBackgroundJob(variantDir, flowCmd, {
           designName: `${top} (${pdk}@${freq}MHz)`, pdk, freq: String(freq), tool: "design-sweep",
-        });
+        }, auth.apiKey);
         jobs.push({ pdk, freq, jobDir: jd });
       }
     }
