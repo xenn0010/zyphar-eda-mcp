@@ -1,4 +1,4 @@
-import { MCPServer, text, image, mix, widget, oauthCustomProvider } from "mcp-use/server";
+import { MCPServer, text, image, mix, widget, oauthCustomProvider, binary } from "mcp-use/server";
 import { z } from "zod";
 import { Client } from "ssh2";
 import { readFileSync } from "fs";
@@ -847,13 +847,12 @@ server.tool(
             fileId: existing.gdsFileId,
           });
           if (url) {
-            return {
-              content: [{ type: "text" as const, text: `GDSII file ready for download:\n${url}` }],
-              structuredContent: {
-                downloadUrl: url,
-                filename: `${filename}.gds`,
-              },
-            };
+            return text(
+              `GDSII Download Ready\n\n` +
+              `Filename: ${filename}.gds\n` +
+              `Download URL: ${url}\n\n` +
+              `Click the link above or copy/paste into your browser to download.`
+            );
           }
         }
       } catch {
@@ -875,13 +874,12 @@ server.tool(
           // Best effort.
         }
       }
-      return {
-        content: [{ type: "text" as const, text: `GDSII file ready for download:\n${result.url}` }],
-        structuredContent: {
-          downloadUrl: result.url,
-          filename: `${filename}.gds`,
-        },
-      };
+      return text(
+        `GDSII Download Ready\n\n` +
+        `Filename: ${filename}.gds\n` +
+        `Download URL: ${result.url}\n\n` +
+        `Click the link above or copy/paste into your browser to download.`
+      );
     }
 
     // Fallback to base64 if Convex is not configured
@@ -889,13 +887,8 @@ server.tool(
     if (!b64) {
       return text("No GDSII file found in job directory.");
     }
-    return {
-      content: [{ type: "text" as const, text: `GDSII file ready: ${filename}.gds` }],
-      structuredContent: {
-        dataUrl: `data:application/octet-stream;base64,${b64}`,
-        filename: `${filename}.gds`,
-      },
-    };
+    // Return binary content - clients that support it can download directly
+    return binary(b64, "application/octet-stream");
   }
 );
 
