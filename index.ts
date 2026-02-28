@@ -1,4 +1,4 @@
-import { MCPServer, text, image, mix, widget, getRequestContext } from "mcp-use/server";
+import { MCPServer, text, image, mix, widget, oauthCustomProvider } from "mcp-use/server";
 import { z } from "zod";
 import { Client } from "ssh2";
 import { readFileSync } from "fs";
@@ -11,8 +11,6 @@ const CONVEX_SITE_URL = process.env.CONVEX_SITE_URL || "https://silent-iguana-37
 function deriveConvexCloudUrl(siteUrl: string): string | null {
   try {
     const parsed = new URL(siteUrl);
-    // Convex site URLs are typically "<deployment>.convex.site".
-    // ConvexHttpClient needs the cloud endpoint "<deployment>.convex.cloud".
     if (parsed.hostname.endsWith(".convex.site")) {
       const deployment = parsed.hostname.slice(0, -".convex.site".length);
       if (deployment) {
@@ -20,7 +18,7 @@ function deriveConvexCloudUrl(siteUrl: string): string | null {
       }
     }
   } catch {
-    // Ignore parse failures and fall back to explicit CONVEX_URL only.
+    // Ignore parse failures
   }
   return null;
 }
@@ -30,60 +28,78 @@ const convex = convexUrl && convexUrl.startsWith("https://")
   ? new ConvexHttpClient(convexUrl)
   : null;
 
-// Track validated users per request
-interface ValidatedUser {
-  userId: string;
-  email: string;
-  plan: string;
-  remaining: number;
+// Custom OAuth provider that validates API keys against Convex
+const apiKeyAuthProvider = oauthCustomProvider({
+  issuer: "https://aule.compute",
+  jwksUrl: "https://aule.compute/.well-known/jwks.json", // Not actually used
+  authEndpoint: "https://aule.compute/auth",
+  tokenEndpoint: "https://aule.compute/token",
+  verifyToken: async (token: string) => {
+    // Token is the API key (e.g., zp_xxx)
+    if (!token || !token.startsWith("zp_")) {
+      throw new Error("Invalid API key format. Keys must start with 'zp_'. Get your API key at https://aule.compute");
+    }
+
+    // Validate against Convex
+    const response = await fetch(`${CONVEX_SITE_URL}/api/validate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ apiKey: token }),
+    });
+
+    const result = await response.json() as {
+      valid: boolean;
+      error?: string;
+      userId?: string;
+      email?: string;
+      plan?: string;
+      remaining?: number
+    };
+
+    if (!result.valid) {
+      throw new Error(result.error || "Invalid API key");
+    }
+
+    // Return payload that will be available via getAuth()
+    return {
+      sub: result.userId,
+      email: result.email,
+      plan: result.plan || "free",
+      remaining: result.remaining || 0,
+      apiKey: token,
+    };
+  },
+  getUserInfo: (payload: any) => ({
+    userId: payload.sub,
+    id: payload.sub,
+    email: payload.email,
+    name: payload.email?.split("@")[0],
+  }),
+});
+
+// Type for auth info passed to tools when OAuth is configured
+interface AuthContext {
+  auth?: {
+    user?: { id?: string; email?: string };
+    payload?: { sub?: string; email?: string; plan?: string; apiKey?: string };
+  };
 }
 
-// Validate API key against Convex backend
-async function validateApiKey(): Promise<ValidatedUser> {
-  const ctx = getRequestContext();
-  if (!ctx) {
-    throw new Error("No request context available");
+// Helper to check auth from tool context
+function requireAuth(ctx: AuthContext): { userId: string; email: string; plan: string; apiKey: string } {
+  if (!ctx.auth || !ctx.auth.payload) {
+    throw new Error("Authentication required. Add 'Authorization: Bearer YOUR_API_KEY' to your MCP configuration.");
   }
-
-  const authHeader = ctx.req.header("Authorization");
-  if (!authHeader) {
-    throw new Error("Missing Authorization header. Add 'Authorization: Bearer YOUR_API_KEY' to your MCP configuration.");
-  }
-
-  const apiKey = authHeader.replace(/^Bearer\s+/i, "").trim();
-  if (!apiKey || !apiKey.startsWith("zp_")) {
-    throw new Error("Invalid API key format. Keys must start with 'zp_'. Get your API key at https://aule.compute");
-  }
-
-  // Validate against Convex
-  const response = await fetch(`${CONVEX_SITE_URL}/api/validate`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ apiKey }),
-  });
-
-  const result = await response.json() as { valid: boolean; error?: string; userId?: string; email?: string; plan?: string; remaining?: number };
-
-  if (!result.valid) {
-    throw new Error(result.error || "Invalid API key");
-  }
-
   return {
-    userId: result.userId!,
-    email: result.email || "",
-    plan: result.plan || "free",
-    remaining: result.remaining || 0,
+    userId: ctx.auth.payload.sub || "",
+    email: ctx.auth.payload.email || "",
+    plan: ctx.auth.payload.plan || "free",
+    apiKey: ctx.auth.payload.apiKey || "",
   };
 }
 
 // Record usage after successful tool execution
-async function recordUsage(tool: string, computeSeconds: number): Promise<void> {
-  const ctx = getRequestContext();
-  if (!ctx) return;
-  const authHeader = ctx.req.header("Authorization");
-  if (!authHeader) return;
-  const apiKey = authHeader.replace(/^Bearer\s+/i, "").trim();
-
+async function recordUsage(apiKey: string, tool: string, computeSeconds: number): Promise<void> {
   try {
     await fetch(`${CONVEX_SITE_URL}/api/record-usage`, {
       method: "POST",
@@ -552,6 +568,7 @@ const server = new MCPServer({
   version: "1.0.0",
   description: "Design chips from chat. Full RTL-to-GDSII: synthesis, place & route, timing, DRC, LVS. Supports Sky130, GF180MCU, ASAP7, IHP SG13G2 PDKs.",
   baseUrl: process.env.MCP_URL || "http://localhost:3000",
+  oauth: apiKeyAuthProvider,
 });
 
 server.tool(
@@ -566,8 +583,8 @@ server.tool(
       clock_port: z.string().max(256).default("clk").describe("Name of the clock port in the design"),
     }),
   },
-  async ({ verilog, top_module, pdk, freq_mhz, clock_port }) => {
-    await validateApiKey();
+  async ({ verilog, top_module, pdk, freq_mhz, clock_port }, ctx) => {
+    requireAuth(ctx);
     const top = top_module || extractTopModule(verilog);
     const inputPath = await uploadFile("input.v", verilog);
     const jobDir = inputPath.replace("/input.v", "");
@@ -593,8 +610,8 @@ server.tool(
       pdk: z.enum(["sky130", "gf180mcu", "asap7", "ihp130"]).default("sky130").describe("Process design kit"),
     }),
   },
-  async ({ design, freq_mhz, pdk }) => {
-    await validateApiKey();
+  async ({ design, freq_mhz, pdk }, ctx) => {
+    requireAuth(ctx);
     const paths: Record<string, [string, string]> = {
       picorv32: ["/tmp/OpenROAD-flow-scripts/flow/designs/src/picorv32/picorv32.v", "picorv32"],
       uart_tx: ["~/Zyphar-new/test_designs/uart_tx.v", "uart_tx"],
@@ -624,8 +641,8 @@ server.tool(
       pdk: z.enum(["sky130", "gf180mcu", "asap7", "ihp130"]).default("sky130"),
     }),
   },
-  async ({ verilog, top_module, pdk }) => {
-    await validateApiKey();
+  async ({ verilog, top_module, pdk }, ctx) => {
+    requireAuth(ctx);
     const top = top_module || extractTopModule(verilog);
     const inputPath = await uploadFile("input.v", verilog);
     const jobDir = inputPath.replace("/input.v", "");
@@ -646,8 +663,8 @@ server.tool(
       freq_mhz: z.number().min(1).max(10000).default(100).describe("Target clock frequency in MHz"),
     }),
   },
-  async ({ cells, pdk, freq_mhz }) => {
-    await validateApiKey();
+  async ({ cells, pdk, freq_mhz }, ctx) => {
+    requireAuth(ctx);
     const params: Record<string, [number, number, number]> = {
       sky130: [2.0, 0.01, 0.1],
       gf180mcu: [1.6, 0.008, 0.085],
@@ -684,8 +701,8 @@ server.tool(
       clock_port: z.string().max(256).default("clk").describe("Name of the clock port"),
     }),
   },
-  async ({ verilog, top_module, pdk, freq_mhz, clock_port }) => {
-    await validateApiKey();
+  async ({ verilog, top_module, pdk, freq_mhz, clock_port }, ctx) => {
+    requireAuth(ctx);
     const top = top_module || extractTopModule(verilog);
     const inputPath = await uploadFile("input.v", verilog);
     const jobDir = inputPath.replace("/input.v", "");
@@ -714,8 +731,8 @@ server.tool(
       invoked: "Job status retrieved",
     },
   },
-  async ({ job_dir }) => {
-    await validateApiKey();
+  async ({ job_dir }, ctx) => {
+    requireAuth(ctx);
     const safeDir = validateJobDir(job_dir);
     const status = await checkJobStatus(safeDir);
 
@@ -779,8 +796,8 @@ server.tool(
       invoked: "Chip layout rendered",
     },
   },
-  async ({ job_dir }) => {
-    await validateApiKey();
+  async ({ job_dir }, ctx) => {
+    requireAuth(ctx);
     const safeDir = validateJobDir(job_dir);
     const layout3d = await extract3DLayout(safeDir);
     if (!layout3d) {
@@ -814,8 +831,8 @@ server.tool(
       filename: z.string().max(256).default("design").describe("Base filename for the downloaded .gds file"),
     }),
   },
-  async ({ job_dir, filename }) => {
-    await validateApiKey();
+  async ({ job_dir, filename }, ctx) => {
+    requireAuth(ctx);
     const safeDir = validateJobDir(job_dir);
     const jobId = safeDir.split("/").pop() || "unknown";
     if (/[\/\\]/.test(filename) || filename.includes("..")) {
@@ -891,8 +908,8 @@ server.tool(
       testbench: z.string().max(10_000_000).describe("Verilog testbench that instantiates the design, drives inputs, and checks outputs using $display and $finish"),
     }),
   },
-  async ({ verilog, testbench }) => {
-    await validateApiKey();
+  async ({ verilog, testbench }, ctx) => {
+    requireAuth(ctx);
     const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     const jobDir = `/tmp/mcp_sim/${jobId}`;
     await runOnEC2(`mkdir -p ${shellEscape(jobDir)}`);
@@ -916,8 +933,8 @@ server.tool(
       fpga: z.enum(["ice40", "ecp5", "xilinx"]).default("ice40").describe("FPGA target: ice40 (Lattice iCE40 HX8K), ecp5 (Lattice ECP5), xilinx (Xilinx 7-series)"),
     }),
   },
-  async ({ verilog, top_module, fpga }) => {
-    await validateApiKey();
+  async ({ verilog, top_module, fpga }, ctx) => {
+    requireAuth(ctx);
     const top = top_module || extractTopModule(verilog);
     const jobId = Date.now().toString(36);
     const jobDir = `/tmp/mcp_fpga/${jobId}`;
@@ -966,8 +983,8 @@ server.tool(
       invoked: "Timing analysis complete",
     },
   },
-  async ({ job_dir, netlist, pdk, freq_mhz, clock_port }) => {
-    await validateApiKey();
+  async ({ job_dir, netlist, pdk, freq_mhz, clock_port }, ctx) => {
+    requireAuth(ctx);
     let netlistPath: string;
     let jobDir: string;
 
@@ -1032,8 +1049,8 @@ server.tool(
       invoked: "DRC complete",
     },
   },
-  async ({ job_dir }) => {
-    await validateApiKey();
+  async ({ job_dir }, ctx) => {
+    requireAuth(ctx);
     const safeDir = validateJobDir(job_dir);
     // Find GDS and determine top module
     const gdsFile = (await runOnEC2(
@@ -1090,8 +1107,8 @@ server.tool(
       invoked: "LVS complete",
     },
   },
-  async ({ job_dir }) => {
-    await validateApiKey();
+  async ({ job_dir }, ctx) => {
+    requireAuth(ctx);
     const safeDir = validateJobDir(job_dir);
     const gdsFile = (await runOnEC2(
       `find ${shellEscape(safeDir)}/output -name "*.gds" 2>/dev/null | head -1`,
@@ -1150,8 +1167,8 @@ server.tool(
       freq_mhz: z.number().min(1).max(10000).default(100).describe("Target clock frequency in MHz"),
     }),
   },
-  async ({ job_dir, netlist, pdk, freq_mhz }) => {
-    await validateApiKey();
+  async ({ job_dir, netlist, pdk, freq_mhz }, ctx) => {
+    requireAuth(ctx);
     let defPath: string | null = null;
     let netlistPath: string | null = null;
 
@@ -1197,8 +1214,8 @@ server.tool(
       fix: z.boolean().default(false).describe("If true, insert synchronizers and return the fixed netlist"),
     }),
   },
-  async ({ netlist, fix }) => {
-    await validateApiKey();
+  async ({ netlist, fix }, ctx) => {
+    requireAuth(ctx);
     const uploaded = await uploadFile("cdc_input.v", netlist);
     const jobDir = uploaded.replace("/cdc_input.v", "");
     const fixFlag = fix ? `--fix --output ${shellEscape(jobDir)}/cdc_fixed.v` : "";
@@ -1230,8 +1247,8 @@ server.tool(
       top_module: z.string().max(256).describe("Top-level module name"),
     }),
   },
-  async ({ rtl, netlist, top_module }) => {
-    await validateApiKey();
+  async ({ rtl, netlist, top_module }, ctx) => {
+    requireAuth(ctx);
     const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     const jobDir = `/tmp/mcp_fec/${jobId}`;
     await runOnEC2(`mkdir -p ${shellEscape(jobDir)}`);
@@ -1268,8 +1285,8 @@ server.tool(
       utilization: z.number().min(0.01).max(1.0).default(0.45).describe("Target utilization (0.0 to 1.0)"),
     }),
   },
-  async ({ netlist, top_module, pdk, freq_mhz, clock_port, utilization }) => {
-    await validateApiKey();
+  async ({ netlist, top_module, pdk, freq_mhz, clock_port, utilization }, ctx) => {
+    requireAuth(ctx);
     const top = top_module || extractTopModule(netlist);
     const inputPath = await uploadFile("netlist.v", netlist);
     const jobDir = inputPath.replace("/netlist.v", "");
@@ -1295,8 +1312,8 @@ server.tool(
       pdk: z.enum(["sky130"]).default("sky130").describe("PDK for memory compilation (Sky130 only)"),
     }),
   },
-  async ({ words, bits, pdk }) => {
-    await validateApiKey();
+  async ({ words, bits, pdk }, ctx) => {
+    requireAuth(ctx);
     const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     const jobDir = `/tmp/mcp_sram/${jobId}`;
     const output = await runOnEC2(
@@ -1318,8 +1335,8 @@ server.tool(
       ground_pads: z.number().int().min(1).max(100).default(4).describe("Number of VSS ground pads"),
     }),
   },
-  async ({ job_dir, die_size, power_pads, ground_pads }) => {
-    await validateApiKey();
+  async ({ job_dir, die_size, power_pads, ground_pads }, ctx) => {
+    requireAuth(ctx);
     const safeDir = validateJobDir(job_dir);
     if (!/^\d+x\d+$/.test(die_size)) {
       return text("Invalid die_size format. Expected WIDTHxHEIGHT (e.g., 2000x2000)");
@@ -1361,8 +1378,8 @@ server.tool(
       variant: z.enum(["caravel", "caravan", "user-project-wrapper"]).default("user-project-wrapper").describe("Caravel integration variant"),
     }),
   },
-  async ({ job_dir, variant }) => {
-    await validateApiKey();
+  async ({ job_dir, variant }, ctx) => {
+    requireAuth(ctx);
     const safeDir = validateJobDir(job_dir);
     const gdsFile = (await runOnEC2(
       `find ${shellEscape(safeDir)}/output -name "*.gds" 2>/dev/null | head -1`,
@@ -1409,8 +1426,8 @@ server.tool(
       top_module: z.string().max(256).optional().describe("Top-level module name. Auto-detected if omitted."),
     }),
   },
-  async ({ verilog, top_module }) => {
-    await validateApiKey();
+  async ({ verilog, top_module }, ctx) => {
+    requireAuth(ctx);
     const top = top_module || extractTopModule(verilog);
     const jobId = Date.now().toString(36);
     const jobDir = `/tmp/mcp_lint/${jobId}`;
@@ -1446,8 +1463,8 @@ server.tool(
       pdk: z.enum(["sky130", "gf180mcu", "asap7", "ihp130"]).default("sky130"),
     }),
   },
-  async ({ job_dir, verilog, pdk }) => {
-    await validateApiKey();
+  async ({ job_dir, verilog, pdk }, ctx) => {
+    requireAuth(ctx);
     let inputPath: string;
 
     if (job_dir) {
@@ -1489,8 +1506,8 @@ server.tool(
       clock_port: z.string().max(256).default("clk").describe("Clock port name"),
     }),
   },
-  async ({ verilog, top_module, frequencies, pdks, clock_port }) => {
-    await validateApiKey();
+  async ({ verilog, top_module, frequencies, pdks, clock_port }, ctx) => {
+    requireAuth(ctx);
     const top = top_module || extractTopModule(verilog);
     const sweepId = Date.now().toString(36);
     const sweepDir = `/tmp/mcp_sweep/${sweepId}`;
@@ -1530,8 +1547,8 @@ server.prompt(
       description: z.string().optional().describe("What kind of chip to design, e.g. 'a UART transmitter' or 'an 8-bit CPU'"),
     }),
   },
-  async ({ description }) => {
-    await validateApiKey();
+  async ({ description }, ctx) => {
+    requireAuth(ctx);
     return {
       messages: [
         {
@@ -1642,8 +1659,8 @@ server.prompt(
       verilog: z.string().optional().describe("Original RTL source code for simulation and equivalence checking"),
     }),
   },
-  async ({ job_dir, verilog }) => {
-    await validateApiKey();
+  async ({ job_dir, verilog }, ctx) => {
+    requireAuth(ctx);
     return {
       messages: [
         {
@@ -1683,8 +1700,8 @@ server.prompt(
       pdk: z.enum(["sky130", "gf180mcu", "asap7", "ihp130"]).default("sky130"),
     }),
   },
-  async ({ verilog, freq_mhz, pdk }) => {
-    await validateApiKey();
+  async ({ verilog, freq_mhz, pdk }, ctx) => {
+    requireAuth(ctx);
     return {
       messages: [
         {
