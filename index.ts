@@ -2,9 +2,12 @@ import { MCPServer, text, image, mix, widget } from "mcp-use/server";
 import { z } from "zod";
 import { Client } from "ssh2";
 import { readFileSync } from "fs";
+import { ConvexHttpClient } from "convex/browser";
 
 const EC2_HOST = "ec2-18-219-59-121.us-east-2.compute.amazonaws.com";
 const ZYPHAR_ENV = "export PATH=$HOME/.cargo/bin:$PATH && export ORFS_PATH=/tmp/OpenROAD-flow-scripts && export IHP_PDK_PATH=/tmp/IHP-Open-PDK && cd ~/Zyphar-new";
+
+const convex = process.env.CONVEX_URL ? new ConvexHttpClient(process.env.CONVEX_URL) : null;
 
 function getSSHKey(): string {
   if (process.env.SSH_PRIVATE_KEY_B64) {
@@ -144,6 +147,44 @@ function extractTopModule(verilog: string): string {
   return match ? match[1] : "top";
 }
 
+async function uploadGdsToConvex(jobDir: string): Promise<{ url: string; fileId: string } | null> {
+  if (!convex) return null;
+  try {
+    const gdsFile = (await runOnEC2Raw(
+      `find ${jobDir}/output -name "*.gds" 2>/dev/null | head -1`
+    )).trim();
+    if (!gdsFile) return null;
+
+    // Get base64 of GDS from EC2
+    const b64 = (await runOnEC2Raw(
+      `base64 "${gdsFile}" | tr -d '\\n'`,
+      60000
+    )).trim();
+    if (b64.length < 100) return null;
+
+    // Get upload URL from Convex
+    const uploadUrl: string = await (convex as any).mutation("designs:generateUploadUrl");
+
+    // Upload the binary data to Convex storage
+    const gdsBuffer = Buffer.from(b64, "base64");
+    const response = await fetch(uploadUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: gdsBuffer,
+    });
+    if (!response.ok) return null;
+    const { storageId } = (await response.json()) as { storageId: string };
+
+    // Get the download URL
+    const url: string | null = await (convex as any).query("designs:getDownloadUrl", { fileId: storageId });
+    if (!url) return null;
+
+    return { url, fileId: storageId };
+  } catch {
+    return null;
+  }
+}
+
 async function startBackgroundJob(
   jobDir: string,
   cmd: string,
@@ -158,6 +199,19 @@ async function startBackgroundJob(
   const bgCmd = `nohup bash -c '${ZYPHAR_ENV} && ${cmd} > ${jobDir}/output.log 2>&1; echo $? > ${jobDir}/exit_code' > /dev/null 2>&1 & echo $!`;
   const pid = (await runOnEC2(bgCmd, 30000)).trim();
   await runOnEC2(`echo '${pid}' > ${jobDir}/pid`, 30000);
+
+  // Record design in Convex (best-effort)
+  if (convex) {
+    try {
+      await (convex as any).mutation("designs:createDesign", {
+        jobId,
+        designName: meta.designName || "unknown",
+        pdk: meta.pdk || "unknown",
+        tool: meta.tool || "design-chip",
+      });
+    } catch { /* best-effort */ }
+  }
+
   return { jobId, jobDir };
 }
 
@@ -167,6 +221,7 @@ interface JobStatus {
   output?: string;
   stats?: Record<string, string>;
   hasGds?: boolean;
+  downloadUrl?: string;
   meta?: Record<string, string>;
 }
 
@@ -225,7 +280,31 @@ async function checkJobStatus(jobDir: string): Promise<JobStatus> {
     `find ${jobDir}/output -name "*.gds" 2>/dev/null | head -1`
   ).then(r => r.trim().length > 0).catch(() => false);
 
-  return { state: "completed", elapsedSeconds, output, stats, hasGds };
+  // Auto-upload GDS to Convex storage for easy download
+  let downloadUrl: string | undefined;
+  if (hasGds) {
+    const result = await uploadGdsToConvex(jobDir);
+    if (result) {
+      downloadUrl = result.url;
+      // Record in Convex DB
+      const jobId = jobDir.split("/").pop() || "unknown";
+      try {
+        if (convex) {
+          await (convex as any).mutation("designs:completeDesign", {
+            jobId,
+            status: "completed",
+            cells: stats.cells || stats.instances,
+            area: stats.area,
+            wns: stats.wns,
+            duration: stats.duration || `${elapsedSeconds}s`,
+            gdsFileId: result.fileId,
+          });
+        }
+      } catch { /* DB record is best-effort */ }
+    }
+  }
+
+  return { state: "completed", elapsedSeconds, output, stats, hasGds, downloadUrl };
 }
 
 function parseDesignStats(output: string): Record<string, string> {
@@ -482,6 +561,10 @@ server.tool(
     const pdkLabel: Record<string, string> = { sky130: "Sky130 130nm", gf180mcu: "GF180MCU 180nm", asap7: "ASAP7 7nm", ihp130: "IHP SG13G2 130nm" };
     const stats = status.stats || {};
 
+    const downloadInfo = status.downloadUrl
+      ? `\n\nGDSII Download (valid 24h):\n${status.downloadUrl}`
+      : "";
+
     return widget({
       props: {
         designName,
@@ -493,8 +576,9 @@ server.tool(
         hasGds: status.hasGds || false,
         jobDir: job_dir,
         filename: designName.replace(/ \(demo\)$/, ""),
+        downloadUrl: status.downloadUrl || null,
       },
-      output: text(status.output || "Completed"),
+      output: text((status.output || "Completed") + downloadInfo),
     });
   }
 );
@@ -539,13 +623,19 @@ server.tool(
 server.tool(
   {
     name: "download-gdsii",
-    description: "Download the GDSII layout file from a completed chip design job. Returns the file as a base64-encoded data URL that can be saved. Called by the chip-design-result widget when the user clicks Download.",
+    description: "Download the GDSII layout file from a completed chip design job. Returns a temporary download URL valid for 24 hours.",
     schema: z.object({
       job_dir: z.string().describe("The job directory from a previous design-chip run"),
       filename: z.string().default("design").describe("Base filename for the downloaded .gds file"),
     }),
   },
   async ({ job_dir, filename }) => {
+    // Try Convex storage (preferred -- real download link)
+    const result = await uploadGdsToConvex(job_dir);
+    if (result) {
+      return text(`GDSII file ready for download:\n${result.url}`);
+    }
+    // Fallback to base64 if Convex is not configured
     const b64 = await getGdsiiBase64(job_dir, filename);
     if (!b64) {
       return text("No GDSII file found in " + job_dir);
