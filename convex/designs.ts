@@ -7,6 +7,7 @@ export const createDesign = mutation({
     designName: v.string(),
     pdk: v.string(),
     tool: v.string(),
+    workerHost: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
     return await ctx.db.insert("designs", {
@@ -26,6 +27,7 @@ export const completeDesign = mutation({
     wns: v.optional(v.string()),
     duration: v.optional(v.string()),
     gdsFileId: v.optional(v.id("_storage")),
+    workerHost: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
     const design = await ctx.db

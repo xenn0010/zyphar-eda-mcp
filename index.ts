@@ -4,9 +4,14 @@ import { Client } from "ssh2";
 import { readFileSync } from "fs";
 import { ConvexHttpClient } from "convex/browser";
 
-const EC2_HOST = process.env.EC2_HOST || "ec2-18-219-59-121.us-east-2.compute.amazonaws.com";
+const DEFAULT_EC2_HOST = "ec2-18-219-59-121.us-east-2.compute.amazonaws.com";
+const EC2_HOSTS = (process.env.EC2_HOSTS || process.env.EC2_HOST || DEFAULT_EC2_HOST)
+  .split(",")
+  .map((h) => h.trim())
+  .filter((h) => h.length > 0);
 const ZYPHAR_ENV = "export PATH=$HOME/.cargo/bin:$PATH && export ORFS_PATH=/tmp/OpenROAD-flow-scripts && export IHP_PDK_PATH=/tmp/IHP-Open-PDK && cd ~/Zyphar-new";
 const CONVEX_SITE_URL = process.env.CONVEX_SITE_URL || "https://silent-iguana-375.convex.site";
+const jobHostCache = new Map<string, string>();
 
 function deriveConvexCloudUrl(siteUrl: string): string | null {
   try {
@@ -136,7 +141,47 @@ function getSSHKey(): string {
   return readFileSync(keyPath, "utf-8");
 }
 
-function runOnEC2Raw(cmd: string, timeoutMs = 1800000): Promise<string> {
+function getPrimaryHost(): string {
+  if (EC2_HOSTS.length === 0) {
+    throw new Error("No EC2 worker host configured. Set EC2_HOST or EC2_HOSTS.");
+  }
+  return EC2_HOSTS[0];
+}
+
+function cacheJobHost(jobId: string, host: string): void {
+  if (jobId && host) jobHostCache.set(jobId, host);
+}
+
+async function chooseWorkerHost(): Promise<string> {
+  if (EC2_HOSTS.length <= 1) return getPrimaryHost();
+
+  const hostLoads = await Promise.all(
+    EC2_HOSTS.map(async (host) => {
+      try {
+        const raw = await runOnEC2Raw(
+          `jobs=$(ps -ef | grep -E "(zyphar flow|openroad|yosys)" | grep -v grep | wc -l | tr -d ' '); ` +
+          `load=$(cut -d" " -f1 /proc/loadavg 2>/dev/null || echo "999"); echo "$jobs $load"`,
+          10000,
+          host
+        );
+        const [jobsText, loadText] = raw.trim().split(/\s+/);
+        const jobs = Number.parseInt(jobsText || "999", 10);
+        const load = Number.parseFloat(loadText || "999");
+        return { host, jobs: Number.isFinite(jobs) ? jobs : 999, load: Number.isFinite(load) ? load : 999 };
+      } catch {
+        return { host, jobs: 999, load: 999 };
+      }
+    })
+  );
+
+  hostLoads.sort((a, b) => {
+    if (a.jobs !== b.jobs) return a.jobs - b.jobs;
+    return a.load - b.load;
+  });
+  return hostLoads[0]?.host || getPrimaryHost();
+}
+
+function runOnEC2Raw(cmd: string, timeoutMs = 1800000, host?: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const conn = new Client();
     let output = "";
@@ -174,7 +219,7 @@ function runOnEC2Raw(cmd: string, timeoutMs = 1800000): Promise<string> {
     });
 
     conn.connect({
-      host: EC2_HOST,
+      host: host || getPrimaryHost(),
       port: 22,
       username: "ubuntu",
       privateKey: getSSHKey(),
@@ -183,18 +228,18 @@ function runOnEC2Raw(cmd: string, timeoutMs = 1800000): Promise<string> {
   });
 }
 
-async function runOnEC2(cmd: string, timeoutMs = 1800000): Promise<string> {
-  const raw = await runOnEC2Raw(cmd, timeoutMs);
+async function runOnEC2(cmd: string, timeoutMs = 1800000, host?: string): Promise<string> {
+  const raw = await runOnEC2Raw(cmd, timeoutMs, host);
   return sanitizeOutput(raw);
 }
 
-async function uploadFile(filename: string, content: string, dir?: string): Promise<string> {
+async function uploadFile(filename: string, content: string, dir?: string, host?: string): Promise<string> {
   if (/[\/\\]/.test(filename) || filename.includes("..")) {
     throw new Error("Invalid filename");
   }
   const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
   const jobDir = dir || `/tmp/mcp_jobs/${jobId}`;
-  await runOnEC2(`mkdir -p ${shellEscape(jobDir)}`);
+  await runOnEC2(`mkdir -p ${shellEscape(jobDir)}`, 1800000, host);
   const filePath = `${jobDir}/${filename}`;
 
   // Use SFTP for reliable file transfer (heredoc fails on large files)
@@ -228,7 +273,7 @@ async function uploadFile(filename: string, content: string, dir?: string): Prom
     });
 
     conn.connect({
-      host: EC2_HOST,
+      host: host || getPrimaryHost(),
       port: 22,
       username: "ubuntu",
       privateKey: getSSHKey(),
@@ -237,7 +282,7 @@ async function uploadFile(filename: string, content: string, dir?: string): Prom
   });
 }
 
-async function downloadFileBuffer(remotePath: string, timeoutMs = 300000): Promise<Buffer> {
+async function downloadFileBuffer(remotePath: string, timeoutMs = 300000, host?: string): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const conn = new Client();
     const chunks: Buffer[] = [];
@@ -277,7 +322,7 @@ async function downloadFileBuffer(remotePath: string, timeoutMs = 300000): Promi
     });
 
     conn.connect({
-      host: EC2_HOST,
+      host: host || getPrimaryHost(),
       port: 22,
       username: "ubuntu",
       privateKey: getSSHKey(),
@@ -335,13 +380,58 @@ function extractTopModule(verilog: string): string {
   return match ? match[1] : "top";
 }
 
-async function findGdsFile(jobDir: string): Promise<string | null> {
+async function resolveJobHost(jobDir: string): Promise<string> {
+  const safeDir = validateJobDir(jobDir);
+  const jobId = safeDir.split("/").pop() || "unknown";
+  const cached = jobHostCache.get(jobId);
+  if (cached) return cached;
+
+  if (convex) {
+    try {
+      const existing = await (convex as any).query("designs:getDesign", { jobId });
+      if (typeof existing?.workerHost === "string" && existing.workerHost.length > 0) {
+        cacheJobHost(jobId, existing.workerHost);
+        return existing.workerHost;
+      }
+    } catch {
+      // Best effort.
+    }
+  }
+
+  if (EC2_HOSTS.length > 1) {
+    const probes = await Promise.all(
+      EC2_HOSTS.map(async (host) => {
+        try {
+          const out = await runOnEC2Raw(
+            `[ -d ${shellEscape(safeDir)} ] && echo "YES" || echo "NO"`,
+            8000,
+            host
+          );
+          return { host, ok: out.trim() === "YES" };
+        } catch {
+          return { host, ok: false };
+        }
+      })
+    );
+    const found = probes.find((p) => p.ok);
+    if (found) {
+      cacheJobHost(jobId, found.host);
+      return found.host;
+    }
+  }
+
+  const fallback = getPrimaryHost();
+  cacheJobHost(jobId, fallback);
+  return fallback;
+}
+
+async function findGdsFile(jobDir: string, host?: string): Promise<string | null> {
   const safeDir = validateJobDir(jobDir);
   const cmd =
     `gds_file=$(find ${shellEscape(safeDir)}/output -type f \\( -iname "*.gds" -o -iname "*.gdsii" \\) 2>/dev/null | head -1); ` +
     `if [ -z "$gds_file" ]; then gds_file=$(find ${shellEscape(safeDir)} -type f \\( -iname "*.gds" -o -iname "*.gdsii" \\) 2>/dev/null | head -1); fi; ` +
     `echo "$gds_file"`;
-  const gdsPath = (await runOnEC2Raw(cmd, 30000)).trim();
+  const gdsPath = (await runOnEC2Raw(cmd, 30000, host)).trim();
   return gdsPath || null;
 }
 
@@ -349,6 +439,7 @@ interface DesignCompletionArgs {
   designName?: string;
   pdk?: string;
   tool?: string;
+  workerHost?: string;
   cells?: string;
   area?: string;
   wns?: string;
@@ -366,6 +457,7 @@ async function markDesignCompletedInConvex(jobId: string, args: DesignCompletion
     wns: args.wns,
     duration: args.duration,
     gdsFileId: args.gdsFileId,
+    workerHost: args.workerHost,
   };
   try {
     const updated = await (convex as any).mutation("designs:completeDesign", completeArgs);
@@ -375,6 +467,7 @@ async function markDesignCompletedInConvex(jobId: string, args: DesignCompletion
       designName: args.designName || jobId,
       pdk: args.pdk || "unknown",
       tool: args.tool || "design-chip",
+      workerHost: args.workerHost,
     });
     await (convex as any).mutation("designs:completeDesign", completeArgs);
   } catch {
@@ -382,15 +475,15 @@ async function markDesignCompletedInConvex(jobId: string, args: DesignCompletion
   }
 }
 
-async function uploadGdsToConvex(jobDir: string): Promise<{ fileId: string; url?: string } | null> {
+async function uploadGdsToConvex(jobDir: string, host?: string): Promise<{ fileId: string; url?: string } | null> {
   if (!convex) return null;
   try {
     const safeDir = validateJobDir(jobDir);
-    const gdsFile = await findGdsFile(safeDir);
+    const gdsFile = await findGdsFile(safeDir, host);
     if (!gdsFile) return null;
 
     // Download the binary directly via SFTP (robust for large GDS files).
-    const gdsBuffer = await downloadFileBuffer(gdsFile, 600000);
+    const gdsBuffer = await downloadFileBuffer(gdsFile, 600000, host);
     if (gdsBuffer.length < 100) return null;
 
     // Get upload URL from Convex
@@ -417,19 +510,42 @@ async function startBackgroundJob(
   jobDir: string,
   cmd: string,
   meta: Record<string, string> = {},
-  _apiKey?: string
-): Promise<{ jobId: string; jobDir: string }> {
+  _apiKey?: string,
+  preferredHost?: string
+): Promise<{ jobId: string; jobDir: string; workerHost: string }> {
   const safeDir = validateJobDir(jobDir);
   const jobId = safeDir.split("/").pop() || "unknown";
+  let workerHost = preferredHost || "";
+  if (!workerHost && EC2_HOSTS.length > 1) {
+    for (const host of EC2_HOSTS) {
+      try {
+        const probe = (await runOnEC2Raw(
+          `[ -d ${shellEscape(safeDir)} ] && echo "YES" || echo "NO"`,
+          8000,
+          host
+        )).trim();
+        if (probe === "YES") {
+          workerHost = host;
+          break;
+        }
+      } catch {
+        // ignore host probe failure
+      }
+    }
+  }
+  if (!workerHost) {
+    workerHost = await chooseWorkerHost();
+  }
+  cacheJobHost(jobId, workerHost);
   // Write metadata via SFTP (safe -- no shell injection)
-  const metaJson = JSON.stringify({ ...meta, startTime: Date.now(), status: "running" });
-  await runOnEC2(`mkdir -p ${shellEscape(safeDir)}/output`, 30000);
-  await uploadFile("meta.json", metaJson, safeDir);
+  const metaJson = JSON.stringify({ ...meta, workerHost, startTime: Date.now(), status: "running" });
+  await runOnEC2(`mkdir -p ${shellEscape(safeDir)}/output`, 30000, workerHost);
+  await uploadFile("meta.json", metaJson, safeDir, workerHost);
   // Launch the actual command in background with nohup
   // The shell writes exit code to exit_code file when done
   const bgCmd = `nohup bash -c '${ZYPHAR_ENV} && ${cmd} > ${shellEscape(safeDir)}/output.log 2>&1; echo $? > ${shellEscape(safeDir)}/exit_code' > /dev/null 2>&1 & echo $!`;
-  const pid = (await runOnEC2(bgCmd, 30000)).trim();
-  await uploadFile("pid", pid, safeDir);
+  const pid = (await runOnEC2(bgCmd, 30000, workerHost)).trim();
+  await uploadFile("pid", pid, safeDir, workerHost);
 
   // Record design in Convex (best-effort) - link to user via API key
   if (convex) {
@@ -439,11 +555,12 @@ async function startBackgroundJob(
         designName: meta.designName || "unknown",
         pdk: meta.pdk || "unknown",
         tool: meta.tool || "design-chip",
+        workerHost,
       });
     } catch { /* best-effort */ }
   }
 
-  return { jobId, jobDir };
+  return { jobId, jobDir, workerHost };
 }
 
 interface JobStatus {
@@ -459,12 +576,16 @@ interface JobStatus {
 async function checkJobStatus(jobDir: string): Promise<JobStatus> {
   const safeDir = validateJobDir(jobDir);
   const jobId = safeDir.split("/").pop() || "unknown";
+  const workerHost = await resolveJobHost(safeDir);
   // Read metadata for start time
   let startTime = Date.now();
   let meta: Record<string, string> = {};
   try {
-    const metaRaw = await runOnEC2(`cat ${shellEscape(safeDir)}/meta.json 2>/dev/null || echo '{}'`, 10000);
+    const metaRaw = await runOnEC2(`cat ${shellEscape(safeDir)}/meta.json 2>/dev/null || echo '{}'`, 10000, workerHost);
     meta = JSON.parse(metaRaw.trim());
+    if (typeof (meta as any).workerHost === "string" && (meta as any).workerHost.length > 0) {
+      cacheJobHost(jobId, (meta as any).workerHost);
+    }
     if (typeof (meta as any).startTime === "number") {
       startTime = (meta as any).startTime;
     }
@@ -475,23 +596,24 @@ async function checkJobStatus(jobDir: string): Promise<JobStatus> {
   // Check if exit_code file exists (means job finished)
   const exitCheck = (await runOnEC2(
     `[ -f ${shellEscape(safeDir)}/exit_code ] && echo "DONE:$(cat ${shellEscape(safeDir)}/exit_code)" || echo "RUNNING"`,
-    10000
+    10000,
+    workerHost
   )).trim();
 
   if (exitCheck === "RUNNING") {
     // Check if process is still alive
     let processAlive = false;
     try {
-      const pidRaw = (await runOnEC2(`cat ${shellEscape(safeDir)}/pid 2>/dev/null || echo ""`, 10000)).trim();
+      const pidRaw = (await runOnEC2(`cat ${shellEscape(safeDir)}/pid 2>/dev/null || echo ""`, 10000, workerHost)).trim();
       if (pidRaw && /^\d+$/.test(pidRaw)) {
-        const psCheck = (await runOnEC2(`kill -0 ${pidRaw} 2>/dev/null && echo "ALIVE" || echo "DEAD"`, 10000)).trim();
+        const psCheck = (await runOnEC2(`kill -0 ${pidRaw} 2>/dev/null && echo "ALIVE" || echo "DEAD"`, 10000, workerHost)).trim();
         processAlive = psCheck === "ALIVE";
       }
     } catch { /* ignore */ }
 
     if (!processAlive) {
       try {
-        const tailLog = await runOnEC2(`tail -20 ${shellEscape(safeDir)}/output.log 2>/dev/null || echo "No log file"`, 10000);
+        const tailLog = await runOnEC2(`tail -20 ${shellEscape(safeDir)}/output.log 2>/dev/null || echo "No log file"`, 10000, workerHost);
         return { state: "failed", elapsedSeconds, output: `Process died unexpectedly.\nLast log lines:\n${tailLog.trim()}` };
       } catch {
         return { state: "failed", elapsedSeconds, output: "Process died unexpectedly. No log available." };
@@ -502,7 +624,7 @@ async function checkJobStatus(jobDir: string): Promise<JobStatus> {
 
   // Job finished -- parse exit code
   const exitCode = exitCheck.replace("DONE:", "").trim();
-  const output = await runOnEC2(`cat ${shellEscape(safeDir)}/output.log 2>/dev/null || echo ""`, 30000);
+  const output = await runOnEC2(`cat ${shellEscape(safeDir)}/output.log 2>/dev/null || echo ""`, 30000, workerHost);
 
   if (exitCode !== "0") {
     const lastLines = output.split("\n").slice(-30).join("\n");
@@ -511,7 +633,7 @@ async function checkJobStatus(jobDir: string): Promise<JobStatus> {
 
   // Success -- parse stats and check for GDS
   const stats = parseDesignStats(output);
-  const hasGds = (await findGdsFile(safeDir)) !== null;
+  const hasGds = (await findGdsFile(safeDir, workerHost)) !== null;
 
   // Prefer existing Convex storage object for this job to avoid re-uploading on every poll.
   let downloadUrl: string | undefined;
@@ -531,7 +653,7 @@ async function checkJobStatus(jobDir: string): Promise<JobStatus> {
 
   // Upload GDS once if not already in Convex.
   if (hasGds && !gdsFileIdForRecord) {
-    const result = await uploadGdsToConvex(safeDir);
+    const result = await uploadGdsToConvex(safeDir, workerHost);
     if (result) {
       gdsFileIdForRecord = result.fileId;
       if (result.url) {
@@ -551,6 +673,7 @@ async function checkJobStatus(jobDir: string): Promise<JobStatus> {
     designName: meta.designName || jobId,
     pdk: meta.pdk || "unknown",
     tool: meta.tool || "design-chip",
+    workerHost,
     cells: stats.cells || stats.instances,
     area: stats.area,
     wns: stats.wns,
@@ -575,12 +698,12 @@ function parseDesignStats(output: string): Record<string, string> {
   return stats;
 }
 
-async function getGdsiiBase64(jobDir: string, _top: string): Promise<string | null> {
+async function getGdsiiBase64(jobDir: string, _top: string, host?: string): Promise<string | null> {
   try {
     const safeDir = validateJobDir(jobDir);
-    const gdsFile = await findGdsFile(safeDir);
+    const gdsFile = await findGdsFile(safeDir, host);
     if (!gdsFile) return null;
-    const b64 = await runOnEC2(`base64 ${shellEscape(gdsFile)} | tr -d '\\n'`, 30000);
+    const b64 = await runOnEC2(`base64 ${shellEscape(gdsFile)} | tr -d '\\n'`, 30000, host);
     if (b64.trim() === "NO_GDS" || b64.trim().length < 100) return null;
     return b64.trim();
   } catch {
@@ -588,35 +711,37 @@ async function getGdsiiBase64(jobDir: string, _top: string): Promise<string | nu
   }
 }
 
-async function extract3DLayout(jobDir: string): Promise<any | null> {
+async function extract3DLayout(jobDir: string, host?: string): Promise<any | null> {
   try {
     const safeDir = validateJobDir(jobDir);
-    const gdsFile = await findGdsFile(safeDir);
+    const gdsFile = await findGdsFile(safeDir, host);
     if (!gdsFile) return null;
     const jsonPath = `${safeDir}/output/layout_3d.json`;
     const result = await runOnEC2(
       `GDS_PATH=${shellEscape(gdsFile)} OUT_PATH=${shellEscape(jsonPath)} klayout -b -r /tmp/extract_3d.py 2>&1`,
-      30000
+      30000,
+      host
     );
     if (!result.includes("OK")) return null;
-    const json = await runOnEC2(`cat ${shellEscape(jsonPath)}`);
+    const json = await runOnEC2(`cat ${shellEscape(jsonPath)}`, 1800000, host);
     return JSON.parse(json);
   } catch {
     return null;
   }
 }
 
-async function renderLayoutPng(jobDir: string): Promise<string | null> {
+async function renderLayoutPng(jobDir: string, host?: string): Promise<string | null> {
   try {
     const safeDir = validateJobDir(jobDir);
     const jsonPath = `${safeDir}/output/layout_3d.json`;
     const pngPath = `${safeDir}/output/layout.png`;
     const result = await runOnEC2(
       `JSON_PATH=${shellEscape(jsonPath)} OUT_PATH=${shellEscape(pngPath)} python3 /tmp/render_layout.py 2>&1`,
-      15000
+      15000,
+      host
     );
     if (!result.includes("OK")) return null;
-    const b64 = await runOnEC2(`base64 ${shellEscape(pngPath)} | tr -d '\\n'`, 15000);
+    const b64 = await runOnEC2(`base64 ${shellEscape(pngPath)} | tr -d '\\n'`, 15000, host);
     if (b64.trim().length > 100) return b64.trim();
     return null;
   } catch {
@@ -648,12 +773,13 @@ server.tool(
   async ({ verilog, top_module, pdk, freq_mhz, clock_port }, ctx) => {
     const auth = requireAuth(ctx);
     const top = top_module || extractTopModule(verilog);
-    const inputPath = await uploadFile("input.v", verilog);
+    const workerHost = await chooseWorkerHost();
+    const inputPath = await uploadFile("input.v", verilog, undefined, workerHost);
     const jobDir = inputPath.replace("/input.v", "");
     const flowCmd = `./target/release/zyphar flow -i ${shellEscape(inputPath)} --top ${shellEscape(top)} --pdk ${shellEscape(pdk)} --freq ${freq_mhz} --clock ${shellEscape(clock_port)} --util 0.50 --gds --detailed-route --output ${shellEscape(jobDir)}/output`;
     const { jobDir: jd } = await startBackgroundJob(jobDir, flowCmd, {
       designName: top, pdk, freq: String(freq_mhz), tool: "design-chip",
-    }, auth.apiKey);
+    }, auth.apiKey, workerHost);
     return text(
       `Job started. Design: ${top}, PDK: ${pdk}, Freq: ${freq_mhz} MHz\n` +
       `Job directory: ${jd}\n\n` +
@@ -706,10 +832,13 @@ server.tool(
   async ({ verilog, top_module, pdk }, ctx) => {
     requireAuth(ctx);
     const top = top_module || extractTopModule(verilog);
-    const inputPath = await uploadFile("input.v", verilog);
+    const workerHost = await chooseWorkerHost();
+    const inputPath = await uploadFile("input.v", verilog, undefined, workerHost);
     const jobDir = inputPath.replace("/input.v", "");
     const output = await runOnEC2(
-      `./target/release/zyphar flow -i ${shellEscape(inputPath)} --top ${shellEscape(top)} --pdk ${shellEscape(pdk)} --skip-pnr --output ${shellEscape(jobDir)}/output 2>&1`
+      `./target/release/zyphar flow -i ${shellEscape(inputPath)} --top ${shellEscape(top)} --pdk ${shellEscape(pdk)} --skip-pnr --output ${shellEscape(jobDir)}/output 2>&1`,
+      1800000,
+      workerHost
     );
     return text(output);
   }
@@ -766,12 +895,13 @@ server.tool(
   async ({ verilog, top_module, pdk, freq_mhz, clock_port }, ctx) => {
     const auth = requireAuth(ctx);
     const top = top_module || extractTopModule(verilog);
-    const inputPath = await uploadFile("input.v", verilog);
+    const workerHost = await chooseWorkerHost();
+    const inputPath = await uploadFile("input.v", verilog, undefined, workerHost);
     const jobDir = inputPath.replace("/input.v", "");
     const flowCmd = `./target/release/zyphar flow -i ${shellEscape(inputPath)} --top ${shellEscape(top)} --pdk ${shellEscape(pdk)} --freq ${freq_mhz} --clock ${shellEscape(clock_port)} --util 0.50 --output ${shellEscape(jobDir)}/output --signoff --gds --detailed-route`;
     const { jobDir: jd } = await startBackgroundJob(jobDir, flowCmd, {
       designName: top, pdk, freq: String(freq_mhz), tool: "design-chip-signoff",
-    }, auth.apiKey);
+    }, auth.apiKey, workerHost);
     return text(
       `Signoff job started. Design: ${top}, PDK: ${pdk}, Freq: ${freq_mhz} MHz\n` +
       `Job directory: ${jd}\n\n` +
@@ -796,6 +926,7 @@ server.tool(
   async ({ job_dir }, ctx) => {
     requireAuth(ctx);
     const safeDir = validateJobDir(job_dir);
+    const workerHost = await resolveJobHost(safeDir);
     const status = await checkJobStatus(safeDir);
 
     if (status.state === "running") {
@@ -814,7 +945,7 @@ server.tool(
     let designName = "unknown";
     let pdkStr = "unknown";
     try {
-      const metaRaw = await runOnEC2(`cat ${shellEscape(safeDir)}/meta.json 2>/dev/null || echo '{}'`, 10000);
+      const metaRaw = await runOnEC2(`cat ${shellEscape(safeDir)}/meta.json 2>/dev/null || echo '{}'`, 10000, workerHost);
       const meta = JSON.parse(metaRaw.trim());
       designName = meta.designName || "unknown";
       pdkStr = meta.pdk || "unknown";
@@ -861,13 +992,14 @@ server.tool(
   async ({ job_dir }, ctx) => {
     requireAuth(ctx);
     const safeDir = validateJobDir(job_dir);
-    const layout3d = await extract3DLayout(safeDir);
+    const workerHost = await resolveJobHost(safeDir);
+    const layout3d = await extract3DLayout(safeDir, workerHost);
     if (!layout3d) {
       return text("No GDSII file found. Run design-chip first.");
     }
     const totalPolys = layout3d.layers.reduce((s: number, l: any) => s + l.polygons.length, 0);
     const summary = `Chip Layout: ${layout3d.die.w.toFixed(1)} x ${layout3d.die.h.toFixed(1)} um die, ${layout3d.layers.length} layers, ${totalPolys} polygons`;
-    const pngB64 = await renderLayoutPng(safeDir);
+    const pngB64 = await renderLayoutPng(safeDir, workerHost);
     if (pngB64) {
       return widget({
         props: {
@@ -897,6 +1029,7 @@ server.tool(
     requireAuth(ctx);
     const safeDir = validateJobDir(job_dir);
     const jobId = safeDir.split("/").pop() || "unknown";
+    const workerHost = await resolveJobHost(safeDir);
     if (/[\/\\]/.test(filename) || filename.includes("..")) {
       return text("Invalid filename.");
     }
@@ -924,13 +1057,14 @@ server.tool(
     }
 
     // Upload to Convex storage if not already present.
-    const result = await uploadGdsToConvex(safeDir);
+    const result = await uploadGdsToConvex(safeDir, workerHost);
     if (result) {
       gdsFileIdForRecord = result.fileId;
       await markDesignCompletedInConvex(jobId, {
         designName: jobId,
         pdk: "unknown",
         tool: "download-gdsii",
+        workerHost,
         gdsFileId: result.fileId,
       });
       const url = result.url || (await resolveConvexDownloadUrl(result.fileId));
@@ -949,6 +1083,7 @@ server.tool(
         designName: jobId,
         pdk: "unknown",
         tool: "download-gdsii",
+        workerHost,
         gdsFileId: gdsFileIdForRecord,
       });
       return text(
@@ -958,7 +1093,7 @@ server.tool(
     }
 
     // Fallback to base64 if Convex is not configured
-    const b64 = await getGdsiiBase64(safeDir, filename);
+    const b64 = await getGdsiiBase64(safeDir, filename, workerHost);
     if (!b64) {
       return text("No GDSII file found in job directory.");
     }
@@ -1055,19 +1190,23 @@ server.tool(
     requireAuth(ctx);
     let netlistPath: string;
     let jobDir: string;
+    let workerHost: string | undefined;
 
     if (job_dir) {
       jobDir = validateJobDir(job_dir);
+      workerHost = await resolveJobHost(jobDir);
       // Find the netlist from the completed job
       netlistPath = (await runOnEC2(
         `find ${shellEscape(jobDir)}/output -name "*.v" -o -name "*.vg" 2>/dev/null | head -1`,
-        10000
+        10000,
+        workerHost
       )).trim();
       if (!netlistPath) {
         return text("No netlist found in job output. Ensure design-chip completed successfully.");
       }
     } else if (netlist) {
-      const uploaded = await uploadFile("netlist.v", netlist);
+      workerHost = await chooseWorkerHost();
+      const uploaded = await uploadFile("netlist.v", netlist, undefined, workerHost);
       jobDir = uploaded.replace("/netlist.v", "");
       netlistPath = uploaded;
     } else {
@@ -1077,7 +1216,8 @@ server.tool(
     const period = (1000 / freq_mhz).toFixed(3);
     const output = await runOnEC2(
       `./target/release/zyphar sta --netlist ${shellEscape(netlistPath)} --pdk ${shellEscape(pdk)} --clock-port ${shellEscape(clock_port)} --clock-period ${period} 2>&1`,
-      60000
+      60000,
+      workerHost
     );
 
     // Parse timing results
@@ -1120,8 +1260,9 @@ server.tool(
   async ({ job_dir }, ctx) => {
     requireAuth(ctx);
     const safeDir = validateJobDir(job_dir);
+    const workerHost = await resolveJobHost(safeDir);
     // Find GDS and determine top module
-    const gdsFile = await findGdsFile(safeDir);
+    const gdsFile = await findGdsFile(safeDir, workerHost);
     if (!gdsFile) {
       return text("No GDSII file found. Run design-chip with --gds first.");
     }
@@ -1129,7 +1270,7 @@ server.tool(
     let top = "unknown";
     let pdkStr = "sky130";
     try {
-      const metaRaw = await runOnEC2(`cat ${shellEscape(safeDir)}/meta.json 2>/dev/null || echo '{}'`, 10000);
+      const metaRaw = await runOnEC2(`cat ${shellEscape(safeDir)}/meta.json 2>/dev/null || echo '{}'`, 10000, workerHost);
       const meta = JSON.parse(metaRaw.trim());
       top = (meta.designName || "unknown").replace(/ \(demo\)$/, "");
       pdkStr = meta.pdk || "sky130";
@@ -1137,7 +1278,8 @@ server.tool(
 
     const output = await runOnEC2(
       `./target/release/zyphar drc --gds ${shellEscape(gdsFile)} --top ${shellEscape(top)} --pdk ${shellEscape(pdkStr)} 2>&1`,
-      120000
+      120000,
+      workerHost
     );
 
     // Parse DRC results
@@ -1175,20 +1317,22 @@ server.tool(
   async ({ job_dir }, ctx) => {
     requireAuth(ctx);
     const safeDir = validateJobDir(job_dir);
-    const gdsFile = await findGdsFile(safeDir);
+    const workerHost = await resolveJobHost(safeDir);
+    const gdsFile = await findGdsFile(safeDir, workerHost);
     if (!gdsFile) {
       return text("No GDSII file found. Run design-chip with --gds first.");
     }
 
     const netlistFile = (await runOnEC2(
       `find ${shellEscape(safeDir)}/output -name "*.v" -o -name "*.vg" 2>/dev/null | head -1`,
-      10000
+      10000,
+      workerHost
     )).trim();
 
     let top = "unknown";
     let pdkStr = "sky130";
     try {
-      const metaRaw = await runOnEC2(`cat ${shellEscape(safeDir)}/meta.json 2>/dev/null || echo '{}'`, 10000);
+      const metaRaw = await runOnEC2(`cat ${shellEscape(safeDir)}/meta.json 2>/dev/null || echo '{}'`, 10000, workerHost);
       const meta = JSON.parse(metaRaw.trim());
       top = (meta.designName || "unknown").replace(/ \(demo\)$/, "");
       pdkStr = meta.pdk || "sky130";
@@ -1196,7 +1340,8 @@ server.tool(
 
     const output = await runOnEC2(
       `./target/release/zyphar lvs --gds ${shellEscape(gdsFile)} --netlist ${shellEscape(netlistFile)} --top ${shellEscape(top)} --pdk ${shellEscape(pdkStr)} 2>&1`,
-      120000
+      120000,
+      workerHost
     );
 
     const match = /(\d+)\/(\d+)\s*circuits?\s*match/i.test(output) || /LVS\s*(clean|CLEAN|passed|match)/i.test(output);
@@ -1233,19 +1378,24 @@ server.tool(
     requireAuth(ctx);
     let defPath: string | null = null;
     let netlistPath: string | null = null;
+    let workerHost: string | undefined;
 
     if (job_dir) {
       const safeDir = validateJobDir(job_dir);
+      workerHost = await resolveJobHost(safeDir);
       defPath = (await runOnEC2(
         `find ${shellEscape(safeDir)}/output -name "*.def" 2>/dev/null | head -1`,
-        10000
+        10000,
+        workerHost
       )).trim() || null;
       netlistPath = (await runOnEC2(
         `find ${shellEscape(safeDir)}/output -name "*.v" -o -name "*.vg" 2>/dev/null | head -1`,
-        10000
+        10000,
+        workerHost
       )).trim() || null;
     } else if (netlist) {
-      const uploaded = await uploadFile("netlist.v", netlist);
+      workerHost = await chooseWorkerHost();
+      const uploaded = await uploadFile("netlist.v", netlist, undefined, workerHost);
       netlistPath = uploaded;
     } else {
       return text("Provide either job_dir (from design-chip) or a netlist.");
@@ -1260,7 +1410,8 @@ server.tool(
     const inputFlag = defPath ? `--def ${shellEscape(defPath)}` : `--netlist ${shellEscape(netlistPath!)}`;
     const output = await runOnEC2(
       `./target/release/zyphar power ${inputFlag} --pdk ${shellEscape(pdk)} --clock-period ${period} 2>&1`,
-      30000
+      30000,
+      workerHost
     );
 
     return text(output);
@@ -1350,12 +1501,13 @@ server.tool(
   async ({ netlist, top_module, pdk, freq_mhz, clock_port, utilization }, ctx) => {
     const auth = requireAuth(ctx);
     const top = top_module || extractTopModule(netlist);
-    const inputPath = await uploadFile("netlist.v", netlist);
+    const workerHost = await chooseWorkerHost();
+    const inputPath = await uploadFile("netlist.v", netlist, undefined, workerHost);
     const jobDir = inputPath.replace("/netlist.v", "");
     const flowCmd = `./target/release/zyphar flow -i ${shellEscape(inputPath)} --top ${shellEscape(top)} --pdk ${shellEscape(pdk)} --freq ${freq_mhz} --clock ${shellEscape(clock_port)} --skip-synth --util ${utilization} --gds --detailed-route --output ${shellEscape(jobDir)}/output`;
     const { jobDir: jd } = await startBackgroundJob(jobDir, flowCmd, {
       designName: top, pdk, freq: String(freq_mhz), tool: "place-and-route",
-    }, auth.apiKey);
+    }, auth.apiKey, workerHost);
     return text(
       `PnR job started. Design: ${top}, PDK: ${pdk}, Freq: ${freq_mhz} MHz, Util: ${utilization}\n` +
       `Job directory: ${jd}\n\n` +
@@ -1400,12 +1552,14 @@ server.tool(
   async ({ job_dir, die_size, power_pads, ground_pads }, ctx) => {
     const auth = requireAuth(ctx);
     const safeDir = validateJobDir(job_dir);
+    const workerHost = await resolveJobHost(safeDir);
     if (!/^\d+x\d+$/.test(die_size)) {
       return text("Invalid die_size format. Expected WIDTHxHEIGHT (e.g., 2000x2000)");
     }
     const defFile = (await runOnEC2(
       `find ${shellEscape(safeDir)}/output -name "*.def" 2>/dev/null | head -1`,
-      10000
+      10000,
+      workerHost
     )).trim();
     if (!defFile) {
       return text("No DEF file found. Run design-chip or place-and-route first.");
@@ -1413,7 +1567,7 @@ server.tool(
 
     let pdkStr = "sky130";
     try {
-      const metaRaw = await runOnEC2(`cat ${shellEscape(safeDir)}/meta.json 2>/dev/null || echo '{}'`, 10000);
+      const metaRaw = await runOnEC2(`cat ${shellEscape(safeDir)}/meta.json 2>/dev/null || echo '{}'`, 10000, workerHost);
       const meta = JSON.parse(metaRaw.trim());
       pdkStr = meta.pdk || "sky130";
     } catch { /* ignore */ }
@@ -1422,7 +1576,7 @@ server.tool(
     const chipCmd = `./target/release/zyphar chip --def ${shellEscape(defFile)} --die-size ${die_size} --pdk ${shellEscape(pdkStr)} --power-pads ${power_pads} --ground-pads ${ground_pads} --output ${shellEscape(chipDir)}/output`;
     const { jobDir: jd } = await startBackgroundJob(chipDir, chipCmd, {
       designName: `chip-assembly`, pdk: pdkStr, tool: "assemble-chip",
-    }, auth.apiKey);
+    }, auth.apiKey, workerHost);
     return text(
       `Chip assembly job started. Die: ${die_size} um, Pads: ${power_pads} VDD + ${ground_pads} VSS\n` +
       `Job directory: ${jd}\n\n` +
@@ -1443,18 +1597,20 @@ server.tool(
   async ({ job_dir, variant }, ctx) => {
     const auth = requireAuth(ctx);
     const safeDir = validateJobDir(job_dir);
-    const gdsFile = await findGdsFile(safeDir);
+    const workerHost = await resolveJobHost(safeDir);
+    const gdsFile = await findGdsFile(safeDir, workerHost);
     if (!gdsFile) {
       return text("No GDSII file found. Run design-chip with --gds first.");
     }
     const netlistFile = (await runOnEC2(
       `find ${shellEscape(safeDir)}/output -name "*.v" -o -name "*.vg" 2>/dev/null | head -1`,
-      10000
+      10000,
+      workerHost
     )).trim();
 
     let top = "unknown";
     try {
-      const metaRaw = await runOnEC2(`cat ${shellEscape(safeDir)}/meta.json 2>/dev/null || echo '{}'`, 10000);
+      const metaRaw = await runOnEC2(`cat ${shellEscape(safeDir)}/meta.json 2>/dev/null || echo '{}'`, 10000, workerHost);
       const meta = JSON.parse(metaRaw.trim());
       top = (meta.designName || "unknown").replace(/ \(demo\)$/, "");
     } catch { /* ignore */ }
@@ -1463,7 +1619,7 @@ server.tool(
     const caravelCmd = `./target/release/zyphar caravel --user-macro ${shellEscape(gdsFile)} --netlist ${shellEscape(netlistFile)} --top ${shellEscape(top)} --variant ${shellEscape(variant)} --output ${shellEscape(caravelDir)}/output`;
     const { jobDir: jd } = await startBackgroundJob(caravelDir, caravelCmd, {
       designName: `${top}-caravel`, pdk: "sky130", tool: "wrap-caravel",
-    }, auth.apiKey);
+    }, auth.apiKey, workerHost);
     return text(
       `Caravel wrap job started. Design: ${top}, Variant: ${variant}\n` +
       `Job directory: ${jd}\n\n` +
@@ -1525,25 +1681,30 @@ server.tool(
   async ({ job_dir, verilog, pdk }, ctx) => {
     requireAuth(ctx);
     let inputPath: string;
+    let workerHost: string | undefined;
 
     if (job_dir) {
       const safeDir = validateJobDir(job_dir);
+      workerHost = await resolveJobHost(safeDir);
       inputPath = (await runOnEC2(
         `find ${shellEscape(safeDir)}/output -name "*.v" -o -name "*.vg" 2>/dev/null | head -1`,
-        10000
+        10000,
+        workerHost
       )).trim();
       if (!inputPath) {
         return text("No netlist found in job output.");
       }
     } else if (verilog) {
-      inputPath = await uploadFile("stats_input.v", verilog);
+      workerHost = await chooseWorkerHost();
+      inputPath = await uploadFile("stats_input.v", verilog, undefined, workerHost);
     } else {
       return text("Provide either job_dir or verilog source.");
     }
 
     const output = await runOnEC2(
       `yosys -p "read_verilog ${shellEscape(inputPath)}; hierarchy -auto-top; stat" 2>&1`,
-      15000
+      15000,
+      workerHost
     );
 
     // Extract stat section
@@ -1570,17 +1731,18 @@ server.tool(
     const top = top_module || extractTopModule(verilog);
     const sweepId = Date.now().toString(36);
     const sweepDir = `/tmp/mcp_sweep/${sweepId}`;
-    const inputPath = await uploadFile("input.v", verilog, sweepDir);
 
     const jobs: { pdk: string; freq: number; jobDir: string }[] = [];
 
     for (const pdk of pdks) {
       for (const freq of frequencies) {
+        const workerHost = await chooseWorkerHost();
         const variantDir = `${sweepDir}/${pdk}_${freq}mhz`;
+        const inputPath = await uploadFile("input.v", verilog, variantDir, workerHost);
         const flowCmd = `./target/release/zyphar flow -i ${shellEscape(inputPath)} --top ${shellEscape(top)} --pdk ${shellEscape(pdk)} --freq ${freq} --clock ${shellEscape(clock_port)} --util 0.50 --gds --detailed-route --output ${shellEscape(variantDir)}/output`;
         const { jobDir: jd } = await startBackgroundJob(variantDir, flowCmd, {
           designName: `${top} (${pdk}@${freq}MHz)`, pdk, freq: String(freq), tool: "design-sweep",
-        }, auth.apiKey);
+        }, auth.apiKey, workerHost);
         jobs.push({ pdk, freq, jobDir: jd });
       }
     }

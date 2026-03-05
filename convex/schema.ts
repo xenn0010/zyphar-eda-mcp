@@ -7,6 +7,7 @@ export default defineSchema({
     designName: v.string(),
     pdk: v.string(),
     tool: v.string(),
+    workerHost: v.optional(v.string()),
     status: v.union(v.literal("running"), v.literal("completed"), v.literal("failed")),
     cells: v.optional(v.string()),
     area: v.optional(v.string()),
