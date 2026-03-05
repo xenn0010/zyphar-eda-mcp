@@ -286,6 +286,26 @@ async function downloadFileBuffer(remotePath: string, timeoutMs = 300000): Promi
   });
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function resolveConvexDownloadUrl(fileId: string, attempts = 6, delayMs = 500): Promise<string | null> {
+  if (!convex) return null;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const url: string | null = await (convex as any).query("designs:getDownloadUrl", { fileId });
+      if (url) return url;
+    } catch {
+      // Retry: transient Convex read/network issues.
+    }
+    if (i < attempts - 1) {
+      await sleep(delayMs);
+    }
+  }
+  return null;
+}
+
 function sanitizeOutput(output: string): string {
   return output
     .replace(/Yosys \d+\.\d+[^\n]*/g, "Zyphar Synthesis Engine")
@@ -315,13 +335,58 @@ function extractTopModule(verilog: string): string {
   return match ? match[1] : "top";
 }
 
-async function uploadGdsToConvex(jobDir: string): Promise<{ url: string; fileId: string } | null> {
+async function findGdsFile(jobDir: string): Promise<string | null> {
+  const safeDir = validateJobDir(jobDir);
+  const cmd =
+    `gds_file=$(find ${shellEscape(safeDir)}/output -type f \\( -iname "*.gds" -o -iname "*.gdsii" \\) 2>/dev/null | head -1); ` +
+    `if [ -z "$gds_file" ]; then gds_file=$(find ${shellEscape(safeDir)} -type f \\( -iname "*.gds" -o -iname "*.gdsii" \\) 2>/dev/null | head -1); fi; ` +
+    `echo "$gds_file"`;
+  const gdsPath = (await runOnEC2Raw(cmd, 30000)).trim();
+  return gdsPath || null;
+}
+
+interface DesignCompletionArgs {
+  designName?: string;
+  pdk?: string;
+  tool?: string;
+  cells?: string;
+  area?: string;
+  wns?: string;
+  duration?: string;
+  gdsFileId?: string;
+}
+
+async function markDesignCompletedInConvex(jobId: string, args: DesignCompletionArgs): Promise<void> {
+  if (!convex) return;
+  const completeArgs = {
+    jobId,
+    status: "completed" as const,
+    cells: args.cells,
+    area: args.area,
+    wns: args.wns,
+    duration: args.duration,
+    gdsFileId: args.gdsFileId,
+  };
+  try {
+    const updated = await (convex as any).mutation("designs:completeDesign", completeArgs);
+    if (updated) return;
+    await (convex as any).mutation("designs:createDesign", {
+      jobId,
+      designName: args.designName || jobId,
+      pdk: args.pdk || "unknown",
+      tool: args.tool || "design-chip",
+    });
+    await (convex as any).mutation("designs:completeDesign", completeArgs);
+  } catch {
+    // Best effort.
+  }
+}
+
+async function uploadGdsToConvex(jobDir: string): Promise<{ fileId: string; url?: string } | null> {
   if (!convex) return null;
   try {
     const safeDir = validateJobDir(jobDir);
-    const gdsFile = (await runOnEC2Raw(
-      `find ${shellEscape(safeDir)}/output -name "*.gds" 2>/dev/null | head -1`
-    )).trim();
+    const gdsFile = await findGdsFile(safeDir);
     if (!gdsFile) return null;
 
     // Download the binary directly via SFTP (robust for large GDS files).
@@ -340,11 +405,9 @@ async function uploadGdsToConvex(jobDir: string): Promise<{ url: string; fileId:
     if (!response.ok) return null;
     const { storageId } = (await response.json()) as { storageId: string };
 
-    // Get the download URL
-    const url: string | null = await (convex as any).query("designs:getDownloadUrl", { fileId: storageId });
-    if (!url) return null;
-
-    return { url, fileId: storageId };
+    // Download URL generation can be briefly delayed after upload.
+    const url = await resolveConvexDownloadUrl(storageId);
+    return url ? { fileId: storageId, url } : { fileId: storageId };
   } catch {
     return null;
   }
@@ -354,7 +417,7 @@ async function startBackgroundJob(
   jobDir: string,
   cmd: string,
   meta: Record<string, string> = {},
-  apiKey?: string
+  _apiKey?: string
 ): Promise<{ jobId: string; jobDir: string }> {
   const safeDir = validateJobDir(jobDir);
   const jobId = safeDir.split("/").pop() || "unknown";
@@ -376,7 +439,6 @@ async function startBackgroundJob(
         designName: meta.designName || "unknown",
         pdk: meta.pdk || "unknown",
         tool: meta.tool || "design-chip",
-        apiKey: apiKey || undefined,
       });
     } catch { /* best-effort */ }
   }
@@ -399,10 +461,13 @@ async function checkJobStatus(jobDir: string): Promise<JobStatus> {
   const jobId = safeDir.split("/").pop() || "unknown";
   // Read metadata for start time
   let startTime = Date.now();
+  let meta: Record<string, string> = {};
   try {
     const metaRaw = await runOnEC2(`cat ${shellEscape(safeDir)}/meta.json 2>/dev/null || echo '{}'`, 10000);
-    const meta = JSON.parse(metaRaw.trim());
-    if (meta.startTime) startTime = meta.startTime;
+    meta = JSON.parse(metaRaw.trim());
+    if (typeof (meta as any).startTime === "number") {
+      startTime = (meta as any).startTime;
+    }
   } catch { /* use current time as fallback */ }
 
   const elapsedSeconds = Math.round((Date.now() - startTime) / 1000);
@@ -446,9 +511,7 @@ async function checkJobStatus(jobDir: string): Promise<JobStatus> {
 
   // Success -- parse stats and check for GDS
   const stats = parseDesignStats(output);
-  const hasGds = await runOnEC2(
-    `find ${shellEscape(safeDir)}/output -name "*.gds" 2>/dev/null | head -1`
-  ).then(r => r.trim().length > 0).catch(() => false);
+  const hasGds = (await findGdsFile(safeDir)) !== null;
 
   // Prefer existing Convex storage object for this job to avoid re-uploading on every poll.
   let downloadUrl: string | undefined;
@@ -458,9 +521,7 @@ async function checkJobStatus(jobDir: string): Promise<JobStatus> {
       const existing = await (convex as any).query("designs:getDesign", { jobId });
       if (existing?.gdsFileId) {
         gdsFileIdForRecord = existing.gdsFileId;
-        const existingUrl: string | null = await (convex as any).query("designs:getDownloadUrl", {
-          fileId: existing.gdsFileId,
-        });
+        const existingUrl = await resolveConvexDownloadUrl(existing.gdsFileId);
         if (existingUrl) downloadUrl = existingUrl;
       }
     } catch {
@@ -469,31 +530,33 @@ async function checkJobStatus(jobDir: string): Promise<JobStatus> {
   }
 
   // Upload GDS once if not already in Convex.
-  if (hasGds && !downloadUrl) {
+  if (hasGds && !gdsFileIdForRecord) {
     const result = await uploadGdsToConvex(safeDir);
     if (result) {
-      downloadUrl = result.url;
       gdsFileIdForRecord = result.fileId;
+      if (result.url) {
+        downloadUrl = result.url;
+      }
     }
   }
 
-  // Always mark the design completed in Convex, even when GDS upload fails.
-  if (convex) {
-    try {
-      const completeArgs: Record<string, string | undefined> = {
-        jobId,
-        status: "completed",
-        cells: stats.cells || stats.instances,
-        area: stats.area,
-        wns: stats.wns,
-        duration: stats.duration || `${elapsedSeconds}s`,
-      };
-      if (gdsFileIdForRecord) completeArgs.gdsFileId = gdsFileIdForRecord;
-      await (convex as any).mutation("designs:completeDesign", completeArgs);
-    } catch {
-      // DB record is best-effort.
-    }
+  // Always try to provide a fresh URL when we know the storage ID.
+  if (gdsFileIdForRecord && !downloadUrl) {
+    const freshUrl = await resolveConvexDownloadUrl(gdsFileIdForRecord);
+    if (freshUrl) downloadUrl = freshUrl;
   }
+
+  // Always mark the design completed in Convex, even when GDS upload fails.
+  await markDesignCompletedInConvex(jobId, {
+    designName: meta.designName || jobId,
+    pdk: meta.pdk || "unknown",
+    tool: meta.tool || "design-chip",
+    cells: stats.cells || stats.instances,
+    area: stats.area,
+    wns: stats.wns,
+    duration: stats.duration || `${elapsedSeconds}s`,
+    gdsFileId: gdsFileIdForRecord,
+  });
 
   return { state: "completed", elapsedSeconds, output, stats, hasGds, downloadUrl };
 }
@@ -515,10 +578,9 @@ function parseDesignStats(output: string): Record<string, string> {
 async function getGdsiiBase64(jobDir: string, _top: string): Promise<string | null> {
   try {
     const safeDir = validateJobDir(jobDir);
-    const b64 = await runOnEC2(
-      `gds_file=$(find ${shellEscape(safeDir)}/output -name "*.gds" 2>/dev/null | head -1) && [ -f "$gds_file" ] && base64 "$gds_file" | tr -d '\\n' || echo "NO_GDS"`,
-      30000
-    );
+    const gdsFile = await findGdsFile(safeDir);
+    if (!gdsFile) return null;
+    const b64 = await runOnEC2(`base64 ${shellEscape(gdsFile)} | tr -d '\\n'`, 30000);
     if (b64.trim() === "NO_GDS" || b64.trim().length < 100) return null;
     return b64.trim();
   } catch {
@@ -529,9 +591,7 @@ async function getGdsiiBase64(jobDir: string, _top: string): Promise<string | nu
 async function extract3DLayout(jobDir: string): Promise<any | null> {
   try {
     const safeDir = validateJobDir(jobDir);
-    const gdsFile = (await runOnEC2(
-      `find ${shellEscape(safeDir)}/output -name "*.gds" 2>/dev/null | head -1`
-    )).trim();
+    const gdsFile = await findGdsFile(safeDir);
     if (!gdsFile) return null;
     const jsonPath = `${safeDir}/output/layout_3d.json`;
     const result = await runOnEC2(
@@ -840,14 +900,15 @@ server.tool(
     if (/[\/\\]/.test(filename) || filename.includes("..")) {
       return text("Invalid filename.");
     }
+    let gdsFileIdForRecord: string | undefined;
+
     // Try existing Convex storage first (preferred -- stable real download link).
     if (convex) {
       try {
         const existing = await (convex as any).query("designs:getDesign", { jobId });
         if (existing?.gdsFileId) {
-          const url: string | null = await (convex as any).query("designs:getDownloadUrl", {
-            fileId: existing.gdsFileId,
-          });
+          gdsFileIdForRecord = existing.gdsFileId;
+          const url = await resolveConvexDownloadUrl(existing.gdsFileId);
           if (url) {
             return text(
               `GDSII Download Ready\n\n` +
@@ -865,22 +926,34 @@ server.tool(
     // Upload to Convex storage if not already present.
     const result = await uploadGdsToConvex(safeDir);
     if (result) {
-      if (convex) {
-        try {
-          await (convex as any).mutation("designs:completeDesign", {
-            jobId,
-            status: "completed",
-            gdsFileId: result.fileId,
-          });
-        } catch {
-          // Best effort.
-        }
+      gdsFileIdForRecord = result.fileId;
+      await markDesignCompletedInConvex(jobId, {
+        designName: jobId,
+        pdk: "unknown",
+        tool: "download-gdsii",
+        gdsFileId: result.fileId,
+      });
+      const url = result.url || (await resolveConvexDownloadUrl(result.fileId));
+      if (url) {
+        return text(
+          `GDSII Download Ready\n\n` +
+          `Filename: ${filename}.gds\n` +
+          `Download URL: ${url}\n\n` +
+          `Click the link above or copy/paste into your browser to download.`
+        );
       }
+    }
+
+    if (gdsFileIdForRecord) {
+      await markDesignCompletedInConvex(jobId, {
+        designName: jobId,
+        pdk: "unknown",
+        tool: "download-gdsii",
+        gdsFileId: gdsFileIdForRecord,
+      });
       return text(
-        `GDSII Download Ready\n\n` +
-        `Filename: ${filename}.gds\n` +
-        `Download URL: ${result.url}\n\n` +
-        `Click the link above or copy/paste into your browser to download.`
+        `GDSII upload completed but the temporary download URL is not ready yet.\n` +
+        `Please retry download-gdsii in a few seconds.`
       );
     }
 
@@ -1048,10 +1121,7 @@ server.tool(
     requireAuth(ctx);
     const safeDir = validateJobDir(job_dir);
     // Find GDS and determine top module
-    const gdsFile = (await runOnEC2(
-      `find ${shellEscape(safeDir)}/output -name "*.gds" 2>/dev/null | head -1`,
-      10000
-    )).trim();
+    const gdsFile = await findGdsFile(safeDir);
     if (!gdsFile) {
       return text("No GDSII file found. Run design-chip with --gds first.");
     }
@@ -1105,10 +1175,7 @@ server.tool(
   async ({ job_dir }, ctx) => {
     requireAuth(ctx);
     const safeDir = validateJobDir(job_dir);
-    const gdsFile = (await runOnEC2(
-      `find ${shellEscape(safeDir)}/output -name "*.gds" 2>/dev/null | head -1`,
-      10000
-    )).trim();
+    const gdsFile = await findGdsFile(safeDir);
     if (!gdsFile) {
       return text("No GDSII file found. Run design-chip with --gds first.");
     }
@@ -1376,10 +1443,7 @@ server.tool(
   async ({ job_dir, variant }, ctx) => {
     const auth = requireAuth(ctx);
     const safeDir = validateJobDir(job_dir);
-    const gdsFile = (await runOnEC2(
-      `find ${shellEscape(safeDir)}/output -name "*.gds" 2>/dev/null | head -1`,
-      10000
-    )).trim();
+    const gdsFile = await findGdsFile(safeDir);
     if (!gdsFile) {
       return text("No GDSII file found. Run design-chip with --gds first.");
     }

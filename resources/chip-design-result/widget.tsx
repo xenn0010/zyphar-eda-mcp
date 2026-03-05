@@ -45,11 +45,6 @@ const ChipDesignResult: React.FC = () => {
     if (!props.jobDir || downloading) return;
     setDownloading(true);
     try {
-      if (props.downloadUrl) {
-        openExternal(props.downloadUrl);
-        return;
-      }
-
       const res = await callTool("download-gdsii", {
         job_dir: props.jobDir,
         filename: props.filename || "design",
@@ -71,10 +66,18 @@ const ChipDesignResult: React.FC = () => {
         const urlMatch = maybeText.match(/https?:\/\/\S+/);
         if (urlMatch?.[0]) {
           openExternal(urlMatch[0]);
+          return;
         }
+      }
+      // Fallback for old clients/paths: try previously cached URL.
+      if (props.downloadUrl) {
+        openExternal(props.downloadUrl);
       }
     } catch (err) {
       console.error("Download failed:", err);
+      if (props.downloadUrl) {
+        openExternal(props.downloadUrl);
+      }
     } finally {
       setDownloading(false);
     }
