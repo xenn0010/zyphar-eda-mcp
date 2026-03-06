@@ -755,6 +755,7 @@ const server = new MCPServer({
   version: "1.0.0",
   description: "Design chips from chat. Full RTL-to-GDSII: synthesis, place & route, timing, DRC, LVS. Supports Sky130, GF180MCU, ASAP7, IHP SG13G2 PDKs.",
   baseUrl: process.env.MCP_URL || "http://localhost:3000",
+  host: process.env.HOST || "0.0.0.0",
   oauth: apiKeyAuthProvider,
 });
 
